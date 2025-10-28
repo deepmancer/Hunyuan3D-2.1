@@ -13,12 +13,17 @@
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 
 import os
+import sys
 import cv2
 import bpy
 import math
 import numpy as np
+import trimesh
 from io import StringIO
+from pathlib import Path
+from ctypes.util import find_library
 from typing import Optional, Tuple, Dict, Any
+from PIL import Image
 
 
 def _safe_extract_attribute(obj: Any, attr_path: str, default: Any = None) -> Any:
@@ -36,6 +41,49 @@ def _convert_to_numpy(data: Any, dtype: np.dtype) -> Optional[np.ndarray]:
     if data is None:
         return None
     return np.asarray(data, dtype=dtype)
+
+
+def _configure_draco_dependency() -> None:
+    """Ensure Blender's glTF exporter can resolve the Draco codec library."""
+
+    env_key = "BLENDER_EXTERN_DRACO_LIBRARY_PATH"
+    if os.environ.get(env_key):
+        return
+
+    candidate_paths = []
+
+    # Prefer bundled library next to the bpy wheel if it exists
+    bpy_root = Path(bpy.__file__).resolve().parents[4]
+    bundle_dir = bpy_root / f"{bpy.app.version[0]}.{bpy.app.version[1]}"
+    python_dir = bundle_dir / "python"
+    candidate_paths.append(
+        python_dir
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+        / "libextern_draco.so"
+    )
+
+    # Common system locations
+    candidate_paths.extend(
+        [
+            Path("/usr/lib/x86_64-linux-gnu/libextern_draco.so"),
+            Path("/usr/lib/x86_64-linux-gnu/libdraco.so"),
+            Path("/usr/local/lib/libextern_draco.so"),
+            Path("/usr/local/lib/libdraco.so"),
+        ]
+    )
+
+    # Resolve via ctypes discovery as a last resort
+    for name in ("extern_draco", "draco"):
+        lib = find_library(name)
+        if lib:
+            candidate_paths.append(Path(lib))
+
+    for path in candidate_paths:
+        if path and path.is_file():
+            os.environ[env_key] = str(path)
+            return
 
 
 def load_mesh(mesh):
@@ -147,6 +195,40 @@ def save_obj_mesh(mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic
 
     # Create MTL file
     _create_mtl_file(base_path, texture_maps, metallic is not None)
+    return texture_maps
+
+def save_ply_mesh(mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic=None, roughness=None, normal=None):
+    """Save mesh as PLY file with texture coordinates preserved."""
+    vtx_pos = _convert_to_numpy(vtx_pos, np.float32)
+    vtx_uv = _convert_to_numpy(vtx_uv, np.float32)
+    pos_idx = _convert_to_numpy(pos_idx, np.int32)
+    uv_idx = _convert_to_numpy(uv_idx, np.int32)
+
+    base_path, _ = _get_base_path_and_name(mesh_path)
+
+    texture_maps = {}
+    if texture is not None:
+        texture_maps["diffuse"] = _save_texture_map(texture, base_path)
+
+    if metallic is not None:
+        texture_maps["metallic"] = _save_texture_map(metallic, base_path, "_metallic", color_convert=cv2.COLOR_RGB2GRAY)
+    if roughness is not None:
+        texture_maps["roughness"] = _save_texture_map(
+            roughness, base_path, "_roughness", color_convert=cv2.COLOR_RGB2GRAY
+        )
+    if normal is not None:
+        texture_maps["normal"] = _save_texture_map(normal, base_path, "_normal")
+
+    mesh = trimesh.Trimesh(vertices=vtx_pos, faces=pos_idx, process=False)
+
+    if vtx_uv is not None and texture is not None:
+        texture_image = (texture * 255).clip(0, 255).astype(np.uint8)
+        pil_image = Image.fromarray(texture_image)
+        mesh.visual = trimesh.visual.texture.TextureVisuals(uv=vtx_uv, image=pil_image)
+
+    mesh.export(mesh_path)
+
+    return texture_maps
 
 
 def _create_mtl_file(base_path: str, texture_maps: Dict[str, str], is_pbr: bool):
@@ -191,10 +273,19 @@ def _create_mtl_file(base_path: str, texture_maps: Dict[str, str], is_pbr: bool)
 
 
 def save_mesh(mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic=None, roughness=None, normal=None):
-    """Save mesh using OBJ format."""
-    save_obj_mesh(
-        mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic=metallic, roughness=roughness, normal=normal
-    )
+    """Save mesh using format inferred from file extension."""
+    ext = os.path.splitext(mesh_path)[1].lower()
+
+    if ext == ".obj":
+        return save_obj_mesh(
+            mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic=metallic, roughness=roughness, normal=normal
+        )
+    elif ext == ".ply":
+        return save_ply_mesh(
+            mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic=metallic, roughness=roughness, normal=normal
+        )
+    else:
+        raise ValueError(f"Unsupported mesh format for export: {ext}")
 
 
 def _setup_blender_scene():
@@ -257,20 +348,27 @@ def _apply_auto_smooth(auto_smooth_angle: float):
         bpy.ops.object.shade_auto_smooth(angle=angle_rad)
 
 
-def convert_obj_to_glb(
-    obj_path: str,
+def convert_mesh_to_glb(
+    mesh_path: str,
     glb_path: str,
     shade_type: str = "SMOOTH",
     auto_smooth_angle: float = 60,
     merge_vertices: bool = False,
 ) -> bool:
-    """Convert OBJ file to GLB format using Blender."""
+    """Convert OBJ or PLY file to GLB format using Blender."""
     try:
+        _configure_draco_dependency()
         _setup_blender_scene()
         _clear_scene_objects()
 
-        # Import OBJ file
-        bpy.ops.wm.obj_import(filepath=obj_path)
+        ext = Path(mesh_path).suffix.lower()
+        if ext == ".obj":
+            bpy.ops.wm.obj_import(filepath=mesh_path)
+        elif ext == ".ply":
+            bpy.ops.import_mesh.ply(filepath=mesh_path)
+        else:
+            raise ValueError(f"Unsupported mesh format for GLB conversion: {ext}")
+
         _select_mesh_objects()
 
         # Process meshes
@@ -278,7 +376,11 @@ def convert_obj_to_glb(
         _apply_shading(shade_type, auto_smooth_angle)
 
         # Export to GLB
-        bpy.ops.export_scene.gltf(filepath=glb_path, use_active_scene=True)
+        bpy.ops.export_scene.gltf(
+            filepath=glb_path,
+            use_active_scene=True,
+            export_draco_mesh_compression_enable=False,
+        )
         return True
     except Exception:
         return False

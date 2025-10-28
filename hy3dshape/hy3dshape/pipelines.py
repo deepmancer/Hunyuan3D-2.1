@@ -748,7 +748,7 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
         if hasattr(self.model, 'guidance_embed') and \
             self.model.guidance_embed is True:
             guidance = torch.tensor([guidance_scale] * batch_size, device=device, dtype=dtype)
-            # logger.info(f'Using guidance embed with scale {guidance_scale}')
+            logger.info(f'Using guidance embed with scale {guidance_scale}')
 
         with synchronize_timer('Diffusion Sampling'):
             for i, t in enumerate(tqdm(timesteps, disable=not enable_pbar, desc="Diffusion Sampling:")):

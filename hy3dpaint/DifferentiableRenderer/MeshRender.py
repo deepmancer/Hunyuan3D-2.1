@@ -650,7 +650,7 @@ class MeshRender:
                     texture_normal, (texture_normal.shape[1] // 2, texture_normal.shape[0] // 2)
                 )
 
-        save_mesh(
+        return save_mesh(
             mesh_path,
             vtx_pos,
             pos_idx,

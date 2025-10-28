@@ -14,28 +14,44 @@
 
 import numpy as np
 from PIL import Image
-
+import sys
 
 class imageSuperNet:
     def __init__(self, config) -> None:
-        from realesrgan import RealESRGANer
-        from basicsr.archs.rrdbnet_arch import RRDBNet
+        sys.path.insert(0, "../../")
+        from data.generative.super_res import CodeFormerEnhancer
+        # from realesrgan import RealESRGANer
+        # from basicsr.archs.rrdbnet_arch import RRDBNet
 
-        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
-        upsampler = RealESRGANer(
-            scale=4,
-            model_path=config.realesrgan_ckpt_path,
-            dni_weight=None,
-            model=model,
-            tile=0,
-            tile_pad=10,
-            pre_pad=0,
-            half=True,
-            gpu_id=None,
+        # model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+        # upsampler = RealESRGANer(
+        #     scale=4,
+        #     model_path=config.realesrgan_ckpt_path,
+        #     dni_weight=None,
+        #     model=model,
+        #     tile=0,
+        #     tile_pad=10,
+        #     pre_pad=0,
+        #     half=True,
+        #     gpu_id=None,
+        # )
+        self.upsampler = CodeFormerEnhancer(
+            device="cuda",
+            ultrasharp=True,
         )
-        self.upsampler = upsampler
+
+        sys.path.pop(0)
 
     def __call__(self, image):
-        output, _ = self.upsampler.enhance(np.array(image))
-        output = Image.fromarray(output)
+        output = self.upsampler.enhance(
+            image,
+            face_align=True,
+            background_enhance=False,
+            face_upsample=False,
+            upscale=2,
+            codeformer_fidelity=0.75,
+        )
+        if not isinstance(output, Image.Image):    
+            output = Image.fromarray(output)
         return output
+    
