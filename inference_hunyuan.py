@@ -2,7 +2,7 @@ import os
 import sys
 import warnings
 from pathlib import Path
-
+import gc
 try:
     import bpy  # noqa: F401  # Optional: available only inside Blender
 except ImportError:
@@ -14,7 +14,11 @@ ROOT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT_DIR / 'hy3dpaint'))
 sys.path.insert(0, str(ROOT_DIR / 'hy3dshape'))
 
+from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
+from hy3dshape.preprocessors import ImageProcessorV2, array_to_tensor
+from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
 import cv2
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -173,7 +177,8 @@ def post_process_mesh(mesh):
 
     return mesh
 
-def run_shape_inference(image_path, output_dir, seed=1234):
+@torch.inference_mode()
+def run_shape_inference(image_path, output_dir, background_remover, seed=1234):
     image_name = os.path.splitext(os.path.basename(image_path))[0]
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -193,32 +198,59 @@ def run_shape_inference(image_path, output_dir, seed=1234):
     # Load image and mask
     with Image.open(image_path) as image_pil_raw:
         image_pil = image_pil_raw.convert('RGB')
-    background_remover = BackgroundRemover()
     image, mask = background_remover.remove_background(image_pil)
     if image.mode != 'RGBA':
         image = image.convert('RGBA')
 
-    white_bg = Image.new('RGB', image.size, (255, 255, 255))
-    alpha_channel = image.split()[3]
-    image = Image.composite(image.convert('RGB'), white_bg, alpha_channel)
+    # Find bounding box of the foreground in the mask
+    mask_array = np.array(mask)
+    coords = np.argwhere(mask_array > 0)
+    if len(coords) == 0:
+        # If mask is empty, use the entire image
+        y_min, x_min = 0, 0
+        y_max, x_max = mask_array.shape
+    else:
+        y_min, x_min = coords.min(axis=0)
+        y_max, x_max = coords.max(axis=0)
+    
+    # Calculate the size of the largest square that fits the bounding box
+    bbox_height = y_max - y_min + 1
+    bbox_width = x_max - x_min + 1
+    square_size = max(bbox_height, bbox_width)
+    
+    # Calculate centering offsets to place bbox in the center of the square
+    y_offset = (square_size - bbox_height) // 2
+    x_offset = (square_size - bbox_width) // 2
+    
+    # Create square images with padding
+    square_image = Image.new('RGBA', (square_size, square_size), (255, 255, 255, 0))
+    square_mask = Image.new('L', (square_size, square_size), 0)
+    
+    # Crop the bounding box and paste into centered position
+    cropped_image = image.crop((x_min, y_min, x_max + 1, y_max + 1))
+    cropped_mask = mask.crop((x_min, y_min, x_max + 1, y_max + 1))
+    
+    square_image.paste(cropped_image, (x_offset, y_offset))
+    square_mask.paste(cropped_mask, (x_offset, y_offset))
+    
+    # Composite with white background
+    white_bg = Image.new('RGB', square_image.size, (255, 255, 255))
+    alpha_channel = square_image.split()[3]
+    final_image = Image.composite(square_image.convert('RGB'), white_bg, alpha_channel)
 
     matted_image_path = matted_image_dir / f'{image_name}.png'
     silhouette_mask_path = silh_mask_dir / f'{image_name}.png'
     # Save preprocessed images
-    image.save(str(matted_image_path))
-    mask.save(str(silhouette_mask_path))
+    final_image.save(str(matted_image_path))
+    square_mask.save(str(silhouette_mask_path))
 
-    # Load model
-    print("Loading Hunyuan3D model...")
-
-    from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
-    from hy3dshape.preprocessors import ImageProcessorV2, array_to_tensor
-
+    # Load shape pipeline
+    print("Loading Hunyuan3D shape model...")
     model_path = 'tencent/Hunyuan3D-2.1'
     pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)
-
-    image_processor = ImageProcessorV2(1024, border_ratio=0.1)
+    image_processor = ImageProcessorV2(border_ratio=0.1)
     pipeline.image_processor = image_processor
+    
     processed_result = image_processor(image)
     processed_img = processed_result['image']
 
@@ -246,7 +278,7 @@ def run_shape_inference(image_path, output_dir, seed=1234):
         output_type='trimesh',
         enable_pbar=True,
         # guidance_scale=5.0,
-        num_inference_steps=80,
+        num_inference_steps=60,
         octree_resolution=512,
         mc_algo=mc_algo,
         num_chunks=20000,
@@ -267,6 +299,9 @@ def run_shape_inference(image_path, output_dir, seed=1234):
     print(f"Saving mesh to: {mesh_path}")
     mesh.export(mesh_path)
 
+    torch.cuda.empty_cache()
+    gc.collect()
+    
     return {
         'mesh_path': mesh_path,
         'image_path': image_path,
@@ -274,8 +309,8 @@ def run_shape_inference(image_path, output_dir, seed=1234):
         'silhouette_mask_path': silhouette_mask_path,
     }
 
+@torch.inference_mode()
 def run_texture_inference(image_path, mesh_path, output_dir, max_num_view=6, resolution=768):
-    from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
     output_dir = Path(output_dir)
     image_path = Path(image_path)
     mesh_path = Path(mesh_path)
@@ -284,10 +319,13 @@ def run_texture_inference(image_path, mesh_path, output_dir, max_num_view=6, res
     textured_mesh_dir = output_dir / 'textured_mesh' / image_name
     textured_mesh_dir.mkdir(parents=True, exist_ok=True)
 
+    # Initialize paint pipeline
+    print("Loading Hunyuan3D paint pipeline...")
     conf = Hunyuan3DPaintConfig(max_num_view, resolution)
     conf.multiview_cfg_path = "/localhome/aha220/Hairdar/modules/Hunyuan3D-2.1/hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
     conf.custom_pipeline = "/localhome/aha220/Hairdar/modules/Hunyuan3D-2.1/hy3dpaint/hunyuanpaintpbr"
     paint_pipeline = Hunyuan3DPaintPipeline(conf)
+    
     textured_mesh_path = textured_mesh_dir / 'textured_mesh.glb'
 
     output_mesh_path = paint_pipeline(
@@ -295,6 +333,10 @@ def run_texture_inference(image_path, mesh_path, output_dir, max_num_view=6, res
         image_path=str(image_path),
         output_mesh_path=str(textured_mesh_path)
     )
+
+    torch.cuda.empty_cache()
+    gc.collect()
+
     return Path(output_mesh_path)
 
 def render_mesh(fname, mesh_path, render_dir, resolution=1024):
@@ -315,7 +357,7 @@ def render_mesh(fname, mesh_path, render_dir, resolution=1024):
     roughness_path = texture_root / 'textured_mesh_roughness.jpg'
     metallic_path = texture_root / 'textured_mesh_metallic.jpg'
 
-    from mathutils import Vector
+    from mathutils import Matrix, Vector
     import addon_utils
 
     mesh_ext = mesh_path.suffix.lower()
@@ -342,20 +384,48 @@ def render_mesh(fname, mesh_path, render_dir, resolution=1024):
 
     scene = bpy.context.scene
     scene.render.engine = 'CYCLES'
-    scene.cycles.samples = 256
+    scene.cycles.samples = 512
+    scene.cycles.use_adaptive_sampling = True
+    scene.cycles.adaptive_threshold = 0.01
+    scene.cycles.adaptive_min_samples = 64
+    if hasattr(scene.cycles, "use_denoising"):
+        scene.cycles.use_denoising = True
     scene.render.resolution_x = resolution
     scene.render.resolution_y = resolution
     scene.render.resolution_percentage = 100
     scene.render.filepath = str(front_view_path)
     scene.render.image_settings.file_format = 'PNG'
-    scene.render.image_settings.color_mode = 'RGB'
+    scene.render.image_settings.color_mode = 'RGBA'
     scene.render.film_transparent = True
 
-    if scene.world and scene.world.use_nodes:
-        bg_node = scene.world.node_tree.nodes.get('Background')
-        if bg_node is not None:
-            bg_node.inputs['Color'].default_value = (1.0, 1.0, 1.0, 1.0)
-            bg_node.inputs['Strength'].default_value = 1.0
+    view_layer = bpy.context.view_layer
+    if hasattr(view_layer, "cycles"):
+        view_layer.cycles.use_denoising = True
+        if hasattr(view_layer.cycles, "denoiser"):
+            has_optix = getattr(bpy.app.build_options, "optix", False)
+            preferred = 'OPTIX' if has_optix else 'OPENIMAGEDENOISE'
+            try:
+                view_layer.cycles.denoiser = preferred
+            except TypeError:
+                # Fallback to Blender default if preferred denoiser unavailable
+                view_layer.cycles.denoiser = 'NLM'
+
+    # Disable world background for transparent rendering
+    if scene.world:
+        if scene.world.use_nodes:
+            # Set background strength to 0 for transparency
+            bg_node = scene.world.node_tree.nodes.get('Background')
+            if bg_node is not None:
+                bg_node.inputs['Strength'].default_value = 0.0
+        else:
+            # Create a minimal world setup with no background
+            scene.world.use_nodes = True
+            scene.world.node_tree.nodes.clear()
+    else:
+        # Create world if it doesn't exist
+        scene.world = bpy.data.worlds.new("TransparentWorld")
+        scene.world.use_nodes = True
+        scene.world.node_tree.nodes.clear()
 
     existing_objects = set(bpy.data.objects)
     bpy.ops.object.select_all(action='DESELECT')
@@ -363,7 +433,7 @@ def render_mesh(fname, mesh_path, render_dir, resolution=1024):
     if mesh_ext in {'.glb', '.gltf'}:
         bpy.ops.import_scene.gltf(filepath=str(mesh_path))
     elif mesh_ext == '.obj':
-        bpy.ops.wm.obj_import(filepath=str(mesh_path), forward_axis='Z', up_axis='NEGATIVE_Y')
+        bpy.ops.wm.obj_import(filepath=str(mesh_path))
     elif mesh_ext == '.ply':
         bpy.ops.wm.ply_import(filepath=str(mesh_path))
     imported_meshes = [obj for obj in bpy.context.selected_objects if obj.type == 'MESH']
@@ -372,6 +442,20 @@ def render_mesh(fname, mesh_path, render_dir, resolution=1024):
     if not imported_meshes:
         raise RuntimeError(f"No mesh geometry imported from {mesh_path}")
 
+    if mesh_ext in {'.glb', '.gltf'}:
+        rotation_matrix = Matrix.Rotation(math.radians(90.0), 4, 'X')
+        new_objects = [obj for obj in bpy.data.objects if obj not in existing_objects]
+        for obj in new_objects:
+            obj.matrix_world = rotation_matrix @ obj.matrix_world
+        bpy.context.view_layer.update()
+        
+    if mesh_ext in [".obj", ".ply"]:
+        rotation_matrix = Matrix.Rotation(math.radians(180.0), 4, 'Y')
+        new_objects = [obj for obj in bpy.data.objects if obj not in existing_objects]
+        for obj in new_objects:
+            obj.matrix_world = rotation_matrix @ obj.matrix_world
+        bpy.context.view_layer.update()
+    
     material = bpy.data.materials.new(name='HairdarMaterial')
     material.use_nodes = True
     nodes = material.node_tree.nodes
@@ -436,13 +520,13 @@ def render_mesh(fname, mesh_path, render_dir, resolution=1024):
 
     camera_data = bpy.data.cameras.new(name='HairdarCamera')
     camera_data.type = 'ORTHO'
-    camera_data.ortho_scale = 1.2
+    camera_data.ortho_scale = 1.1
     camera_data.clip_start = 0.01
     camera_data.clip_end = cam_distance * 4.0
 
     camera_obj = bpy.data.objects.new('HairdarCamera', camera_data)
-    camera_obj.location = center + Vector((0.0, 0.0, cam_distance))
-    camera_obj.rotation_euler = (np.radians(0.0), 0, 0)
+    camera_obj.location = center + Vector((0.0, -cam_distance, 0.0))
+    camera_obj.rotation_euler = (np.radians(90.0), 0, 0)
     scene.collection.objects.link(camera_obj)
     scene.camera = camera_obj
 
@@ -460,19 +544,21 @@ def render_mesh(fname, mesh_path, render_dir, resolution=1024):
 
     return front_view_path
 
+
 def fit_smplx(image_path, lmk_output_dir, smplx_output_dir, smplx_transforms_output_dir):
-    preprocess_modules_dir = ROOT_DIR.parent.parent
+    preprocess_modules_dir = "/localhome/aha220/Hairdar"
     print(f"Adding preprocess modules to sys.path: {preprocess_modules_dir}")
     sys.path.insert(0, str(preprocess_modules_dir))
+    
 
     from data.preprocess.estimate_lmk import run_all as lmk_run_all
     from data.preprocess.estimate_smplx import run_all as smplx_run_all
     from data.preprocess.estimate_smplx_fixed_camera import run_all as smplx_fixed_camera_run_all
 
-    # lmk_run_all(
-    #     input_dir=image_path,
-    #     output_dir=lmk_output_dir,
-    # )
+    lmk_run_all(
+        input_dir=image_path,
+        output_dir=lmk_output_dir,
+    )
     
     # smplx_run_all(
     #     input_dir=image_path,
@@ -480,29 +566,25 @@ def fit_smplx(image_path, lmk_output_dir, smplx_output_dir, smplx_transforms_out
     #     output_dir=smplx_output_dir,
     # )
     
-    smplx_fixed_camera_run_all(
-        input_dir=image_path,
-        lmk_dir=lmk_output_dir,
-        smplx_params_dir=smplx_output_dir,
-        output_dir=smplx_transforms_output_dir,
-    )
+    # smplx_fixed_camera_run_all(
+    #     input_dir=image_path,
+    #     lmk_dir=lmk_output_dir,
+    #     smplx_params_dir=smplx_output_dir,
+    #     output_dir=smplx_transforms_output_dir,
+    # )
 
-def main():
+def run_single_inference(image_name: str, background_remover, output_dir):
     """Main function to run the shape inference pipeline."""
-    # Input paths
-    src_image_path = Path("/localhome/aha220/Hairdar/assets/test_data/img/005.jpg")
+    # Input paths - use the image from the images_dir based on image_name
+    src_image_path = output_dir / 'image' / f"{image_name}.png"
     if not src_image_path.is_file():
         raise FileNotFoundError(f"Input image not found: {src_image_path}")
 
-    fname = src_image_path.stem
-    output_dir = ROOT_DIR / 'outputs'
-    dest_image_path = output_dir / 'image' / f"{fname}.png"
-    dest_image_path.parent.mkdir(parents=True, exist_ok=True)
+    fname = image_name
+    dest_image_path = src_image_path
     matted_image_path = output_dir / 'matted_image' / f'{fname}.png'
     mesh_path = output_dir / 'shape_mesh' / f'{fname}.glb'
     textured_mesh_path = output_dir / 'textured_mesh' / fname / 'textured_mesh.glb'
-    with Image.open(src_image_path) as src_image:
-        src_image.convert('RGB').save(dest_image_path)
 
     if mesh_path.exists():
         print(f"Mesh already exists at {mesh_path}, skipping shape inference.")
@@ -510,6 +592,7 @@ def main():
         run_shape_inference(
             image_path=str(dest_image_path),
             output_dir=str(output_dir),
+            background_remover=background_remover,
             seed=123
         )
 
@@ -533,25 +616,56 @@ def main():
             mesh_path=textured_mesh_path,
             render_dir=render_dir,
         )
-        
+    
     lmk_output_dir = output_dir / 'lmk'
     smplx_output_dir = output_dir / 'smplx_params'
     smplx_transforms_output_dir = output_dir / 'smplx_transforms'
-    fit_smplx(
-        image_path=render_dir,
-        lmk_output_dir=lmk_output_dir,
-        smplx_output_dir=smplx_output_dir,
-        smplx_transforms_output_dir=smplx_transforms_output_dir,
-    )
+
+    # fit_smplx(
+    #     image_path=render_dir,
+    #     lmk_output_dir=lmk_output_dir,
+    #     smplx_output_dir=smplx_output_dir,
+    #     smplx_transforms_output_dir=smplx_transforms_output_dir,
+    # )
     
-    transformed_smplx_mesh_path = smplx_transforms_output_dir / 'transformed_mesh' / f'{fname}.obj'
-    transformed_smplx_render_dir = output_dir / 'render_smplx'
-    transformed_smplx_render_dir.mkdir(parents=True, exist_ok=True)
-    render_mesh(
-        fname=f'{fname}_smplx',
-        mesh_path=transformed_smplx_mesh_path,
-        render_dir=transformed_smplx_render_dir,
-    )
+    # transformed_smplx_mesh_path = smplx_transforms_output_dir / 'transformed_mesh' / f'{fname}.obj'
+    # transformed_smplx_render_dir = output_dir / 'render_smplx'
+    # transformed_smplx_render_dir.mkdir(parents=True, exist_ok=True)
+    # render_mesh(
+    #     fname=f'{fname}',
+    #     mesh_path=transformed_smplx_mesh_path,
+    #     render_dir=transformed_smplx_render_dir,
+    # )
+
+def main(data_dir: str = "/localhome/aha220/Hairdar/modules/Hunyuan3D-2.1/outputs/"):
+    output_dir = Path(data_dir)
     
+    # Initialize background remover once for all images
+    print("Loading background remover...")
+    background_remover = BackgroundRemover()
+    
+    images_dir = output_dir / 'image'
+    # Convert WEBP, JPEG, JPG images to PNG first
+    for ext in ['*.webp', '*.jpeg', '*.jpg']:
+        for image_file in images_dir.glob(ext):
+            print(f"Converting {image_file.name} to PNG format...")
+            with Image.open(image_file) as img:
+                png_path = image_file.with_suffix('.png')
+                img.convert('RGB').save(png_path, 'PNG')
+                image_file.unlink()  # Remove original file
+                print(f"Converted and saved as {png_path.name}")
+    
+    for image_file in images_dir.glob("*.png"):
+        print(f"Processing image: {image_file}")
+        image_fname = image_file.stem
+        print(f"Image filename: {image_fname}")
+        # if image_fname == "005":
+        #     continue
+        run_single_inference(
+            image_name=image_file.stem,
+            background_remover=background_remover,
+            output_dir=output_dir
+        )
+        
 if __name__ == "__main__":
     main()

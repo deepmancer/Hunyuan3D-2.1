@@ -166,10 +166,11 @@ def export_mesh(mesh, save_folder, textured=False, type='glb'):
 
 def quick_convert_with_obj2gltf(obj_path: str, glb_path: str) -> bool:
     # 执行转换
+    base_path, _ = os.path.splitext(obj_path)
     textures = {
-        'albedo': obj_path.replace('.obj', '.jpg'),
-        'metallic': obj_path.replace('.obj', '_metallic.jpg'),
-        'roughness': obj_path.replace('.obj', '_roughness.jpg')
+        'albedo': f"{base_path}.jpg",
+        'metallic': f"{base_path}_metallic.jpg",
+        'roughness': f"{base_path}_roughness.jpg"
         }
     create_glb_with_pbr_materials(obj_path, textures, glb_path)
             
@@ -377,7 +378,7 @@ def generation_all(
 
     tmp_time = time.time()
 
-    text_path = os.path.join(save_folder, f'textured_mesh.obj')
+    text_path = os.path.join(save_folder, f'textured_mesh.ply')
     path_textured = tex_pipeline(mesh_path=path, image_path=image, output_mesh_path=text_path, save_glb=False)
         
     logger.info("---Texture Generation takes %s seconds ---" % (time.time() - tmp_time))

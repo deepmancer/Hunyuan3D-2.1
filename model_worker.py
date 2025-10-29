@@ -31,11 +31,12 @@ from hy3dpaint.convert_utils import create_glb_with_pbr_materials
 
 
 def quick_convert_with_obj2gltf(obj_path: str, glb_path: str):
+    base_path = os.path.splitext(obj_path)[0]
     textures = {
-        'albedo': obj_path.replace('.obj', '.jpg'),
-        'metallic': obj_path.replace('.obj', '_metallic.jpg'),
-        'roughness': obj_path.replace('.obj', '_roughness.jpg')
-        }
+        'albedo': f"{base_path}.jpg",
+        'metallic': f"{base_path}_metallic.jpg",
+        'roughness': f"{base_path}_roughness.jpg",
+    }
     create_glb_with_pbr_materials(obj_path, textures, glb_path)
 
 
@@ -181,7 +182,7 @@ class ModelWorker:
         
         # Generate textured mesh as obj ( as in demo )
         try:
-            output_mesh_path_obj = os.path.join(self.save_dir, f'{str(uid)}_texturing.obj')
+            output_mesh_path_obj = os.path.join(self.save_dir, f'{str(uid)}_texturing.ply')
             textured_path_obj = self.paint_pipeline(
                 mesh_path=initial_save_path,
                 image_path=image,
