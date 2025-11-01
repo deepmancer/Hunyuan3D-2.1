@@ -248,7 +248,7 @@ def run_shape_inference(image_path, output_dir, background_remover, seed=1234):
     print("Loading Hunyuan3D shape model...")
     model_path = 'tencent/Hunyuan3D-2.1'
     pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)
-    image_processor = ImageProcessorV2(border_ratio=0.1)
+    image_processor = ImageProcessorV2(1024, border_ratio=0.1)
     pipeline.image_processor = image_processor
     
     processed_result = image_processor(image)
@@ -278,7 +278,7 @@ def run_shape_inference(image_path, output_dir, background_remover, seed=1234):
         output_type='trimesh',
         enable_pbar=True,
         # guidance_scale=5.0,
-        num_inference_steps=60,
+        num_inference_steps=80,
         octree_resolution=512,
         mc_algo=mc_algo,
         num_chunks=20000,
@@ -298,6 +298,12 @@ def run_shape_inference(image_path, output_dir, background_remover, seed=1234):
     # Save mesh
     print(f"Saving mesh to: {mesh_path}")
     mesh.export(mesh_path)
+
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    del pipeline
+    del background_remover
 
     torch.cuda.empty_cache()
     gc.collect()
@@ -333,6 +339,11 @@ def run_texture_inference(image_path, mesh_path, output_dir, max_num_view=6, res
         image_path=str(image_path),
         output_mesh_path=str(textured_mesh_path)
     )
+
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    del paint_pipeline
 
     torch.cuda.empty_cache()
     gc.collect()
