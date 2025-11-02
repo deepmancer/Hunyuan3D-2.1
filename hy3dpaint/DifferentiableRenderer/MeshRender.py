@@ -674,6 +674,23 @@ class MeshRender:
             scale_factor: Scaling factor for mesh normalization
             auto_center: Whether to automatically center and scale the mesh
         """
+        print(f"set_mesh() called with: {len(vtx_pos)} vertices, {len(pos_idx)} faces")
+        
+        # Validate input arrays before conversion
+        if len(pos_idx) > 0:
+            max_idx = pos_idx.max()
+            min_idx = pos_idx.min()
+            if max_idx >= len(vtx_pos) or min_idx < 0:
+                print(f"ERROR: set_mesh() received invalid pos_idx: range [{min_idx}, {max_idx}], vertices: {len(vtx_pos)}")
+                raise ValueError(f"Invalid face indices in set_mesh: max index {max_idx} >= vertex count {len(vtx_pos)}")
+        
+        if vtx_uv is not None and uv_idx is not None and len(uv_idx) > 0:
+            max_uv_idx = uv_idx.max()
+            min_uv_idx = uv_idx.min()
+            if max_uv_idx >= len(vtx_uv) or min_uv_idx < 0:
+                print(f"ERROR: set_mesh() received invalid uv_idx: range [{min_uv_idx}, {max_uv_idx}], UV vertices: {len(vtx_uv)}")
+                raise ValueError(f"Invalid UV indices in set_mesh: max index {max_uv_idx} >= UV count {len(vtx_uv)}")
+        
         self.vtx_pos = torch.from_numpy(vtx_pos).to(self.device)
         self.pos_idx = torch.from_numpy(pos_idx).to(self.device)
 
@@ -699,6 +716,8 @@ class MeshRender:
         else:
             self.vtx_uv = None
             self.uv_idx = None
+        
+        print(f"set_mesh() after tensor conversion: pos_idx shape={self.pos_idx.shape}, dtype={self.pos_idx.dtype}")
 
         self.vtx_pos[:, [0, 1]] = -self.vtx_pos[:, [0, 1]]
         self.vtx_pos[:, [1, 2]] = self.vtx_pos[:, [2, 1]]
@@ -826,10 +845,49 @@ class MeshRender:
         Returns:
             Tuple of (vertex_positions, face_indices, uv_coordinates, uv_indices)
         """
-        vtx_pos = self.vtx_pos.cpu().numpy()
-        pos_idx = self.pos_idx.cpu().numpy()
-        vtx_uv = self.vtx_uv.cpu().numpy()
-        uv_idx = self.uv_idx.cpu().numpy()
+        # Convert to numpy with explicit contiguous copy to ensure proper memory layout
+        vtx_pos = self.vtx_pos.cpu().numpy().copy()
+        pos_idx = self.pos_idx.cpu().numpy().copy()
+        vtx_uv = self.vtx_uv.cpu().numpy().copy()
+        uv_idx = self.uv_idx.cpu().numpy().copy()
+
+        # Ensure correct data types
+        vtx_pos = vtx_pos.astype(np.float32)
+        pos_idx = pos_idx.astype(np.int32)
+        vtx_uv = vtx_uv.astype(np.float32)
+        uv_idx = uv_idx.astype(np.int32)
+
+        # Validate face indices before any transformations
+        num_vertices = len(vtx_pos)
+        if len(pos_idx) > 0:
+            max_pos_idx = pos_idx.max()
+            min_pos_idx = pos_idx.min()
+            if max_pos_idx >= num_vertices or min_pos_idx < 0:
+                print(f"ERROR: get_mesh() has invalid pos_idx: range [{min_pos_idx}, {max_pos_idx}], vertices: {num_vertices}")
+                print(f"This indicates corruption in the rendering pipeline")
+                # Try to salvage
+                valid_mask = np.all(pos_idx < num_vertices, axis=1) & np.all(pos_idx >= 0, axis=1)
+                if not np.all(valid_mask):
+                    print(f"Warning: Removing {(~valid_mask).sum()} invalid faces from pos_idx")
+                    pos_idx = pos_idx[valid_mask]
+                    if len(uv_idx) == len(valid_mask):
+                        uv_idx = uv_idx[valid_mask]
+        
+        # Validate UV indices
+        num_uv_vertices = len(vtx_uv)
+        if len(uv_idx) > 0:
+            max_uv_idx = uv_idx.max()
+            min_uv_idx = uv_idx.min()
+            if max_uv_idx >= num_uv_vertices or min_uv_idx < 0:
+                print(f"ERROR: get_mesh() has invalid uv_idx: range [{min_uv_idx}, {max_uv_idx}], uv vertices: {num_uv_vertices}")
+                print(f"This indicates corruption in the UV coordinate handling")
+                # Try to salvage
+                valid_mask = np.all(uv_idx < num_uv_vertices, axis=1) & np.all(uv_idx >= 0, axis=1)
+                if not np.all(valid_mask):
+                    print(f"Warning: Removing {(~valid_mask).sum()} invalid faces from uv_idx")
+                    uv_idx = uv_idx[valid_mask]
+                    if len(pos_idx) == len(valid_mask):
+                        pos_idx = pos_idx[valid_mask]
 
         # 坐标变换的逆变换
         if not normalize:
@@ -839,6 +897,9 @@ class MeshRender:
         vtx_pos[:, [0, 1]] = -vtx_pos[:, [0, 1]]
 
         vtx_uv[:, 1] = 1.0 - vtx_uv[:, 1]
+        
+        print(f"get_mesh() returning: {len(vtx_pos)} vertices, {len(pos_idx)} faces, {len(vtx_uv)} UV vertices, {len(uv_idx)} UV faces")
+        
         return vtx_pos, pos_idx, vtx_uv, uv_idx
 
     def get_texture(self):

@@ -96,11 +96,39 @@ def load_mesh(mesh):
     vtx_uv = _safe_extract_attribute(mesh, "visual.uv")
     uv_idx = pos_idx  # Reuse face indices for UV mapping
 
+    print(f"load_mesh() extracted from trimesh object:")
+    print(f"  vtx_pos: shape={vtx_pos.shape if vtx_pos is not None else None}, dtype={vtx_pos.dtype if vtx_pos is not None else None}")
+    print(f"  pos_idx: shape={pos_idx.shape if pos_idx is not None else None}, dtype={pos_idx.dtype if pos_idx is not None else None}")
+    print(f"  vtx_uv: shape={vtx_uv.shape if vtx_uv is not None else None}, dtype={vtx_uv.dtype if vtx_uv is not None else None}")
+
     # Convert to numpy arrays with appropriate dtypes
     vtx_pos = _convert_to_numpy(vtx_pos, np.float32)
     pos_idx = _convert_to_numpy(pos_idx, np.int32)
     vtx_uv = _convert_to_numpy(vtx_uv, np.float32)
     uv_idx = _convert_to_numpy(uv_idx, np.int32)
+
+    # Validate the loaded data
+    if pos_idx is not None and len(pos_idx) > 0 and vtx_pos is not None:
+        max_idx = pos_idx.max()
+        min_idx = pos_idx.min()
+        if max_idx >= len(vtx_pos) or min_idx < 0:
+            print(f"ERROR: load_mesh() extracted invalid face indices!")
+            print(f"  Face index range: [{min_idx}, {max_idx}]")
+            print(f"  Vertex count: {len(vtx_pos)}")
+            print(f"  This means the trimesh object itself has corrupted face indices")
+            raise ValueError(f"Corrupted mesh data: face indices out of range")
+
+    if uv_idx is not None and len(uv_idx) > 0 and vtx_uv is not None:
+        max_uv_idx = uv_idx.max()
+        min_uv_idx = uv_idx.min()
+        if max_uv_idx >= len(vtx_uv) or min_uv_idx < 0:
+            print(f"ERROR: load_mesh() has invalid UV indices!")
+            print(f"  UV index range: [{min_uv_idx}, {max_uv_idx}]")
+            print(f"  UV vertex count: {len(vtx_uv)}")
+            print(f"  This means the trimesh UV data is corrupted")
+            raise ValueError(f"Corrupted UV data: UV indices out of range")
+
+    print(f"load_mesh() returning validated data")
 
     texture_data = None
     return vtx_pos, pos_idx, vtx_uv, uv_idx, texture_data
@@ -204,6 +232,29 @@ def save_ply_mesh(mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic
     pos_idx = _convert_to_numpy(pos_idx, np.int32)
     uv_idx = _convert_to_numpy(uv_idx, np.int32)
 
+    # Validate face indices before creating mesh
+    num_vertices = len(vtx_pos)
+    if len(pos_idx) > 0:
+        max_face_idx = pos_idx.max()
+        min_face_idx = pos_idx.min()
+        
+        if max_face_idx >= num_vertices or min_face_idx < 0:
+            print(f"Warning: Invalid face indices detected in save_ply_mesh (range: {min_face_idx} to {max_face_idx}, vertices: {num_vertices})")
+            print(f"Cleaning face indices before export...")
+            
+            # Remove invalid faces
+            valid_faces_mask = np.all(pos_idx < num_vertices, axis=1) & np.all(pos_idx >= 0, axis=1)
+            pos_idx = pos_idx[valid_faces_mask]
+            
+            if uv_idx is not None and len(uv_idx) == len(valid_faces_mask):
+                uv_idx = uv_idx[valid_faces_mask]
+            
+            print(f"Cleaned: {valid_faces_mask.sum()} valid faces out of {len(valid_faces_mask)} total")
+    
+    # Ensure correct data types to prevent segfaults
+    pos_idx = pos_idx.astype(np.int32)
+    vtx_pos = vtx_pos.astype(np.float32)
+
     base_path, _ = _get_base_path_and_name(mesh_path)
 
     texture_maps = {}
@@ -226,6 +277,13 @@ def save_ply_mesh(mesh_path, vtx_pos, pos_idx, vtx_uv, uv_idx, texture, metallic
         pil_image = Image.fromarray(texture_image)
         mesh.visual = trimesh.visual.texture.TextureVisuals(uv=vtx_uv, image=pil_image)
 
+    # Final validation before export
+    if len(mesh.faces) > 0:
+        max_idx = mesh.faces.max()
+        if max_idx >= len(mesh.vertices):
+            raise ValueError(f"Mesh has invalid face indices (max: {max_idx}, vertices: {len(mesh.vertices)}). Cannot export safely.")
+    
+    print(f"Exporting PLY mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces to {mesh_path}")
     mesh.export(mesh_path)
 
     return texture_maps

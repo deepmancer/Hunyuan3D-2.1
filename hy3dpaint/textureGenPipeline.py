@@ -434,6 +434,44 @@ class Hunyuan3DPaintPipeline:
 
         # Load mesh
         mesh = trimesh.load(processed_mesh_path, force="mesh")
+        
+        # Validate and clean mesh immediately after loading
+        print(f"Loaded mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+        
+        # Check for invalid face indices that could cause segfaults
+        num_vertices = len(mesh.vertices)
+        if len(mesh.faces) > 0:
+            # Check for out-of-range indices
+            max_face_idx = mesh.faces.max()
+            min_face_idx = mesh.faces.min()
+            
+            if max_face_idx >= num_vertices or min_face_idx < 0:
+                print(f"Warning: Invalid face indices detected (range: {min_face_idx} to {max_face_idx}, vertices: {num_vertices})")
+                print(f"Cleaning mesh to remove invalid faces...")
+                
+                # Remove faces with invalid indices
+                valid_faces_mask = np.all(mesh.faces < num_vertices, axis=1) & np.all(mesh.faces >= 0, axis=1)
+                mesh.update_faces(valid_faces_mask)
+                mesh.remove_unreferenced_vertices()
+                print(f"Cleaned mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+        
+        # Ensure face indices are int32 (not uint32 or corrupted types)
+        if len(mesh.faces) > 0:
+            if mesh.faces.dtype not in (np.int32, np.int64):
+                print(f"Warning: Converting face indices from {mesh.faces.dtype} to int32")
+                # First clip any out-of-range values before converting
+                mesh.faces = np.clip(mesh.faces, 0, len(mesh.vertices) - 1)
+                mesh.faces = mesh.faces.astype(np.int32)
+        
+        # Validate vertices are finite
+        if not np.all(np.isfinite(mesh.vertices)):
+            print("Warning: Mesh contains non-finite vertices, attempting to fix...")
+            finite_mask = np.all(np.isfinite(mesh.vertices), axis=1)
+            if not np.all(finite_mask):
+                # This is a severe issue - we can't safely proceed
+                raise ValueError(f"Mesh contains {(~finite_mask).sum()} non-finite vertices that cannot be repaired")
+        
+        print("Mesh validation complete, proceeding with UV wrapping...")
         mesh = mesh_uv_wrap(mesh)
         self.render.load_mesh(mesh=mesh)
 

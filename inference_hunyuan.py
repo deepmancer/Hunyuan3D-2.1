@@ -1,24 +1,23 @@
 import os
 import sys
 import warnings
-from pathlib import Path
 import gc
+import math
+from pathlib import Path
+
 try:
     import bpy  # noqa: F401  # Optional: available only inside Blender
 except ImportError:
     bpy = None
 
-sys.path.insert(0, "modules/Hunyuan3D-2.1")
-
+# --- Path setup ---
 ROOT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, "modules/Hunyuan3D-2.1")
 sys.path.insert(0, str(ROOT_DIR / 'hy3dpaint'))
 sys.path.insert(0, str(ROOT_DIR / 'hy3dshape'))
 
-from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
-from hy3dshape.preprocessors import ImageProcessorV2, array_to_tensor
-from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
+# --- Third-party imports ---
 import cv2
-import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -26,16 +25,18 @@ import trimesh
 from PIL import Image
 from trimesh import repair
 
+# --- Local imports ---
+from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
+from hy3dshape.preprocessors import ImageProcessorV2, array_to_tensor
+from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
+
 try:
     import diso  # noqa: F401  # Optional dependency
     _HAS_DISO = True
 except ImportError:
     _HAS_DISO = False
 
-from ben2 import BEN_Base
-
-torch.set_float32_matmul_precision(['high', 'highest'][0])
-
+# torch.set_float32_matmul_precision('high')
 
 try:
     from torchvision_fix import apply_fix
@@ -44,7 +45,6 @@ except ImportError:
     print("Warning: torchvision_fix module not found, proceeding without compatibility fix")                                      
 except Exception as e:
     print(f"Warning: Failed to apply torchvision fix: {e}")
-
 
 def enable_gpus():
     preferences = bpy.context.preferences
@@ -100,71 +100,107 @@ def torch_to_pil(image_tensor: torch.Tensor) -> Image.Image:
     else:
         processed_img_pil = image_tensor
     return processed_img_pil
-class BackgroundRemover:
-    
-    def __init__(self, device: str | torch.device = 'cuda'):
-        self.device = torch.device(device)
-        self.birefnet = self._init_birefnet()
-    
-    def _init_birefnet(self) -> nn.Module:
-        model = BEN_Base.from_pretrained("PramaLLC/BEN2").to(self.device)
-        model.eval()
-        return model
-    
-    def remove_background(self, image: Image.Image) -> tuple[Image.Image, Image.Image]:
-        foreground = self.birefnet.inference(image, refine_foreground=False)
-        alpha = foreground.getchannel('A')
-        mask = (np.array(alpha) / 255.0 > 0.5).astype(np.uint8) * 255
-        return foreground, Image.fromarray(mask)
 
 def post_process_mesh(mesh):
     if not isinstance(mesh, trimesh.Trimesh):
         raise TypeError("post_process_mesh expects a trimesh.Trimesh instance")
 
     # Work on a copy to avoid mutating pipeline internals unexpectedly.
-    mesh = mesh.copy()
+    try:
+        mesh = mesh.copy()
+    except Exception as e:
+        print(f"  Warning: Failed to copy mesh: {e}")
+        print(f"  Working with original mesh (may have side effects)")
 
     print(f"  Original mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+    
+    # Initial validation: check for invalid face indices
+    num_vertices = len(mesh.vertices)
+    if len(mesh.faces) > 0:
+        max_face_idx = mesh.faces.max()
+        min_face_idx = mesh.faces.min()
+        if max_face_idx >= num_vertices or min_face_idx < 0:
+            print(f"  Warning: Invalid face indices detected (range: {min_face_idx} to {max_face_idx}, vertices: {num_vertices})")
+            valid_faces_mask = np.all(mesh.faces < num_vertices, axis=1) & np.all(mesh.faces >= 0, axis=1)
+            mesh.update_faces(valid_faces_mask)
+            print(f"  Removed invalid faces -> {len(mesh.faces)} faces remaining")
 
     # Step 1: Remove duplicate faces using the non-deprecated API.
-    unique_faces = mesh.unique_faces()
-    if len(unique_faces) != len(mesh.faces):
-        mesh.update_faces(unique_faces)
-        mesh.remove_unreferenced_vertices()
-        print(f"  Removed duplicate faces -> {len(mesh.faces)} faces")
+    try:
+        unique_faces = mesh.unique_faces()
+        if len(unique_faces) != len(mesh.faces):
+            mesh.update_faces(unique_faces)
+            mesh.remove_unreferenced_vertices()
+            print(f"  Removed duplicate faces -> {len(mesh.faces)} faces")
+    except Exception as e:
+        print(f"  Warning: Failed to remove duplicate faces: {e}")
 
     # Step 2: Drop degenerate faces that collapse to a line or point.
-    nondegenerate_mask = mesh.nondegenerate_faces()
-    if not np.all(nondegenerate_mask):
-        mesh.update_faces(nondegenerate_mask)
-        mesh.remove_unreferenced_vertices()
-        print(f"  Removed degenerate faces -> {len(mesh.faces)} faces")
+    try:
+        nondegenerate_mask = mesh.nondegenerate_faces()
+        if not np.all(nondegenerate_mask):
+            mesh.update_faces(nondegenerate_mask)
+            mesh.remove_unreferenced_vertices()
+            print(f"  Removed degenerate faces -> {len(mesh.faces)} faces")
+    except Exception as e:
+        print(f"  Warning: Failed to remove degenerate faces: {e}")
 
     # Step 3: Split into connected components and keep the one with largest surface area.
-    components = mesh.split(only_watertight=False)
-    if len(components) > 1:
-        print(f"  Found {len(components)} connected components")
-        components = sorted(components, key=lambda m: (m.area, len(m.faces)), reverse=True)
-        mesh = components[0]
-        print(f"  Retained largest component: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+    try:
+        components = mesh.split(only_watertight=False)
+        if len(components) > 1:
+            print(f"  Found {len(components)} connected components")
+            components = sorted(components, key=lambda m: (m.area, len(m.faces)), reverse=True)
+            mesh = components[0]
+            print(f"  Retained largest component: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+    except Exception as e:
+        print(f"  Warning: Failed to split components: {e}")
 
     # Step 4: Repair holes and close small gaps to approach watertightness.
-    if not mesh.is_watertight:
-        print("  Mesh is not watertight, attempting repairs...")
-
-        changed = mesh.fill_holes()
-        if changed:
-            print("    Filled holes via fill_holes()")
-
+    try:
         if not mesh.is_watertight:
-            mesh.remove_unreferenced_vertices()
-            mesh.merge_vertices()
-            mesh.remove_unreferenced_vertices()
-            mesh.fill_holes()
+            print("  Mesh is not watertight, attempting repairs...")
+
+            changed = mesh.fill_holes()
+            if changed:
+                print("    Filled holes via fill_holes()")
+
+            if not mesh.is_watertight:
+                mesh.remove_unreferenced_vertices()
+                mesh.merge_vertices()
+                mesh.remove_unreferenced_vertices()
+                mesh.fill_holes()
+    except Exception as e:
+        print(f"  Warning: Failed to repair mesh watertightness: {e}")
 
     # Step 5: Final cleanup and validation to guarantee consistency.
     mesh.remove_unreferenced_vertices()
     mesh.fix_normals()
+    
+    # Step 6: Validate face indices to prevent segmentation faults during export
+    # Remove faces with invalid vertex indices
+    num_vertices = len(mesh.vertices)
+    if len(mesh.faces) > 0:
+        valid_faces_mask = np.all(mesh.faces < num_vertices, axis=1) & np.all(mesh.faces >= 0, axis=1)
+        
+        if not np.all(valid_faces_mask):
+            invalid_count = (~valid_faces_mask).sum()
+            print(f"  Warning: Found {invalid_count} faces with invalid vertex indices, removing...")
+            mesh.update_faces(valid_faces_mask)
+            mesh.remove_unreferenced_vertices()
+            print(f"  Cleaned mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+    
+    # Step 7: Ensure data types are correct (int32 for faces, float for vertices)
+    try:
+        if mesh.faces.dtype != np.int32 and mesh.faces.dtype != np.int64:
+            print(f"  Converting faces from {mesh.faces.dtype} to int32...")
+            mesh.faces = mesh.faces.astype(np.int32)
+        
+        if not np.issubdtype(mesh.vertices.dtype, np.floating):
+            print(f"  Converting vertices from {mesh.vertices.dtype} to float32...")
+            mesh.vertices = mesh.vertices.astype(np.float32)
+    except Exception as e:
+        print(f"  Warning: Failed to fix data types: {e}")
 
     is_watertight = mesh.is_watertight
     is_winding_consistent = mesh.is_winding_consistent
@@ -178,71 +214,18 @@ def post_process_mesh(mesh):
     return mesh
 
 @torch.inference_mode()
-def run_shape_inference(image_path, output_dir, background_remover, seed=1234):
+def run_shape_inference(image_path, output_dir, seed=1234):
     image_name = os.path.splitext(os.path.basename(image_path))[0]
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Create subdirectories for organized output
-    matted_image_dir = output_dir / 'matted_image'
-    silh_mask_dir = output_dir / 'silhouette_mask'
     shape_mesh_dir = output_dir / 'shape_mesh'
     preprocessed_img_dir = output_dir / 'preprocessed_image'
-    matted_image_dir.mkdir(exist_ok=True)
-    silh_mask_dir.mkdir(exist_ok=True)
     shape_mesh_dir.mkdir(exist_ok=True)
     preprocessed_img_dir.mkdir(exist_ok=True)
     
     mesh_path = shape_mesh_dir / f'{image_name}.glb'
-
-    # Load image and mask
-    with Image.open(image_path) as image_pil_raw:
-        image_pil = image_pil_raw.convert('RGB')
-    image, mask = background_remover.remove_background(image_pil)
-    if image.mode != 'RGBA':
-        image = image.convert('RGBA')
-
-    # Find bounding box of the foreground in the mask
-    mask_array = np.array(mask)
-    coords = np.argwhere(mask_array > 0)
-    if len(coords) == 0:
-        # If mask is empty, use the entire image
-        y_min, x_min = 0, 0
-        y_max, x_max = mask_array.shape
-    else:
-        y_min, x_min = coords.min(axis=0)
-        y_max, x_max = coords.max(axis=0)
-    
-    # Calculate the size of the largest square that fits the bounding box
-    bbox_height = y_max - y_min + 1
-    bbox_width = x_max - x_min + 1
-    square_size = max(bbox_height, bbox_width)
-    
-    # Calculate centering offsets to place bbox in the center of the square
-    y_offset = (square_size - bbox_height) // 2
-    x_offset = (square_size - bbox_width) // 2
-    
-    # Create square images with padding
-    square_image = Image.new('RGBA', (square_size, square_size), (255, 255, 255, 0))
-    square_mask = Image.new('L', (square_size, square_size), 0)
-    
-    # Crop the bounding box and paste into centered position
-    cropped_image = image.crop((x_min, y_min, x_max + 1, y_max + 1))
-    cropped_mask = mask.crop((x_min, y_min, x_max + 1, y_max + 1))
-    
-    square_image.paste(cropped_image, (x_offset, y_offset))
-    square_mask.paste(cropped_mask, (x_offset, y_offset))
-    
-    # Composite with white background
-    white_bg = Image.new('RGB', square_image.size, (255, 255, 255))
-    alpha_channel = square_image.split()[3]
-    final_image = Image.composite(square_image.convert('RGB'), white_bg, alpha_channel)
-
-    matted_image_path = matted_image_dir / f'{image_name}.png'
-    silhouette_mask_path = silh_mask_dir / f'{image_name}.png'
-    # Save preprocessed images
-    final_image.save(str(matted_image_path))
-    square_mask.save(str(silhouette_mask_path))
+    matted_image_path = Path(image_path)
 
     # Load shape pipeline
     print("Loading Hunyuan3D shape model...")
@@ -251,8 +234,9 @@ def run_shape_inference(image_path, output_dir, background_remover, seed=1234):
     image_processor = ImageProcessorV2(1024, border_ratio=0.1)
     pipeline.image_processor = image_processor
     
-    processed_result = image_processor(image)
-    processed_img = processed_result['image']
+    with Image.open(matted_image_path) as image_pil:
+        processed_result = image_processor(image_pil)
+        processed_img = processed_result['image']
 
     processed_img_path = preprocessed_img_dir / f'{image_name}.png'
     processed_img_pil = torch_to_pil(processed_img)
@@ -262,7 +246,7 @@ def run_shape_inference(image_path, output_dir, background_remover, seed=1234):
     generator = torch.Generator(device=pipeline.device).manual_seed(seed)
    
     # Check for differentiable marching cubes support
-    if _HAS_DISO:
+    if False and _HAS_DISO:
         mc_algo = 'dmc'
         print("Using differentiable marching cubes (dmc)")
     else:
@@ -278,10 +262,10 @@ def run_shape_inference(image_path, output_dir, background_remover, seed=1234):
         output_type='trimesh',
         enable_pbar=True,
         # guidance_scale=5.0,
-        num_inference_steps=80,
+        num_inference_steps=30,
         octree_resolution=512,
         mc_algo=mc_algo,
-        num_chunks=20000,
+        num_chunks=8000,
     )
 
     # Handle output
@@ -290,20 +274,51 @@ def run_shape_inference(image_path, output_dir, background_remover, seed=1234):
     
     if mesh is None:
         raise RuntimeError("Mesh generation failed; check the input images and GPU memory availability")
+    
+    # Validate mesh before post-processing
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise TypeError(f"Expected trimesh.Trimesh, got {type(mesh)}")
+    
+    if len(mesh.vertices) == 0:
+        raise RuntimeError("Generated mesh has no vertices")
+    
+    if len(mesh.faces) == 0:
+        raise RuntimeError("Generated mesh has no faces")
+    
+    print(f"Generated mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
 
     # Post-process mesh: make watertight and keep largest component
     print("Post-processing mesh...")
-    mesh = post_process_mesh(mesh)
+    # mesh = post_process_mesh(mesh)
     
-    # Save mesh
+    # Save mesh with error handling
     print(f"Saving mesh to: {mesh_path}")
-    mesh.export(mesh_path)
+    try:
+        # Validate mesh before export
+        if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+            raise ValueError("Mesh has no vertices or faces after post-processing")
+        
+        # Attempt export
+        mesh.export(mesh_path)
+        print(f"  Successfully saved mesh to {mesh_path}")
+    except Exception as e:
+        print(f"  Error during mesh export: {e}")
+        print(f"  Attempting fallback export to OBJ format...")
+        try:
+            # Fallback: try OBJ format which is more forgiving
+            fallback_path = mesh_path.with_suffix('.obj')
+            mesh.export(fallback_path)
+            print(f"  Saved as OBJ format to: {fallback_path}")
+            # Update mesh_path for return value
+            mesh_path = fallback_path
+        except Exception as fallback_error:
+            print(f"  Fallback export also failed: {fallback_error}")
+            raise RuntimeError(f"Failed to export mesh in both GLB and OBJ formats: {e}")
 
     torch.cuda.empty_cache()
     gc.collect()
     
     del pipeline
-    del background_remover
 
     torch.cuda.empty_cache()
     gc.collect()
@@ -312,7 +327,6 @@ def run_shape_inference(image_path, output_dir, background_remover, seed=1234):
         'mesh_path': mesh_path,
         'image_path': image_path,
         'matted_image_path': matted_image_path,
-        'silhouette_mask_path': silhouette_mask_path,
     }
 
 @torch.inference_mode()
@@ -555,45 +569,14 @@ def render_mesh(fname, mesh_path, render_dir, resolution=1024):
 
     return front_view_path
 
-
-def fit_smplx(image_path, lmk_output_dir, smplx_output_dir, smplx_transforms_output_dir):
-    preprocess_modules_dir = "/localhome/aha220/Hairdar"
-    print(f"Adding preprocess modules to sys.path: {preprocess_modules_dir}")
-    sys.path.insert(0, str(preprocess_modules_dir))
-    
-
-    from data.preprocess.estimate_lmk import run_all as lmk_run_all
-    from data.preprocess.estimate_smplx import run_all as smplx_run_all
-    from data.preprocess.estimate_smplx_fixed_camera import run_all as smplx_fixed_camera_run_all
-
-    lmk_run_all(
-        input_dir=image_path,
-        output_dir=lmk_output_dir,
-    )
-    
-    # smplx_run_all(
-    #     input_dir=image_path,
-    #     lmk_dir=lmk_output_dir,
-    #     output_dir=smplx_output_dir,
-    # )
-    
-    # smplx_fixed_camera_run_all(
-    #     input_dir=image_path,
-    #     lmk_dir=lmk_output_dir,
-    #     smplx_params_dir=smplx_output_dir,
-    #     output_dir=smplx_transforms_output_dir,
-    # )
-
-def run_single_inference(image_name: str, background_remover, output_dir):
+def run_single_inference(image_name: str, output_dir):
     """Main function to run the shape inference pipeline."""
-    # Input paths - use the image from the images_dir based on image_name
-    src_image_path = output_dir / 'image' / f"{image_name}.png"
-    if not src_image_path.is_file():
-        raise FileNotFoundError(f"Input image not found: {src_image_path}")
-
     fname = image_name
-    dest_image_path = src_image_path
     matted_image_path = output_dir / 'matted_image' / f'{fname}.png'
+
+    if not matted_image_path.is_file():
+        raise FileNotFoundError(f"Matted image not found: {matted_image_path}")
+
     mesh_path = output_dir / 'shape_mesh' / f'{fname}.glb'
     textured_mesh_path = output_dir / 'textured_mesh' / fname / 'textured_mesh.glb'
 
@@ -601,10 +584,9 @@ def run_single_inference(image_name: str, background_remover, output_dir):
         print(f"Mesh already exists at {mesh_path}, skipping shape inference.")
     else:
         run_shape_inference(
-            image_path=str(dest_image_path),
+            image_path=str(matted_image_path),
             output_dir=str(output_dir),
-            background_remover=background_remover,
-            seed=123
+            seed=32
         )
 
     if textured_mesh_path.exists():
@@ -628,55 +610,24 @@ def run_single_inference(image_name: str, background_remover, output_dir):
             render_dir=render_dir,
         )
     
-    lmk_output_dir = output_dir / 'lmk'
-    smplx_output_dir = output_dir / 'smplx_params'
-    smplx_transforms_output_dir = output_dir / 'smplx_transforms'
-
-    # fit_smplx(
-    #     image_path=render_dir,
-    #     lmk_output_dir=lmk_output_dir,
-    #     smplx_output_dir=smplx_output_dir,
-    #     smplx_transforms_output_dir=smplx_transforms_output_dir,
-    # )
-    
-    # transformed_smplx_mesh_path = smplx_transforms_output_dir / 'transformed_mesh' / f'{fname}.obj'
-    # transformed_smplx_render_dir = output_dir / 'render_smplx'
-    # transformed_smplx_render_dir.mkdir(parents=True, exist_ok=True)
-    # render_mesh(
-    #     fname=f'{fname}',
-    #     mesh_path=transformed_smplx_mesh_path,
-    #     render_dir=transformed_smplx_render_dir,
-    # )
 
 def main(data_dir: str = "/localhome/aha220/Hairdar/modules/Hunyuan3D-2.1/outputs/"):
     output_dir = Path(data_dir)
-    
-    # Initialize background remover once for all images
-    print("Loading background remover...")
-    background_remover = BackgroundRemover()
-    
-    images_dir = output_dir / 'image'
-    # Convert WEBP, JPEG, JPG images to PNG first
-    for ext in ['*.webp', '*.jpeg', '*.jpg']:
-        for image_file in images_dir.glob(ext):
-            print(f"Converting {image_file.name} to PNG format...")
-            with Image.open(image_file) as img:
-                png_path = image_file.with_suffix('.png')
-                img.convert('RGB').save(png_path, 'PNG')
-                image_file.unlink()  # Remove original file
-                print(f"Converted and saved as {png_path.name}")
-    
-    for image_file in images_dir.glob("*.png"):
-        print(f"Processing image: {image_file}")
-        image_fname = image_file.stem
-        print(f"Image filename: {image_fname}")
-        # if image_fname == "005":
-        #     continue
-        run_single_inference(
-            image_name=image_file.stem,
-            background_remover=background_remover,
-            output_dir=output_dir
-        )
+    matted_images_dir = output_dir / 'matted_image'
+
+    if not matted_images_dir.exists():
+        raise FileNotFoundError(f"Matted images directory not found: {matted_images_dir}")
+
+    for image_file in matted_images_dir.glob("*.png"):
+        try:
+            if image_file.stem != "hair_113":
+                continue
+            run_single_inference(
+                image_name=image_file.stem,
+                output_dir=output_dir
+            )
+        except Exception as e:
+            print(f"Error processing {image_file}: {e}")
         
 if __name__ == "__main__":
     main()
