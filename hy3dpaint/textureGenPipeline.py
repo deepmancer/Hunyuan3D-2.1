@@ -41,9 +41,6 @@ from diffusers.utils import logging as diffusers_logging
 diffusers_logging.set_verbosity(50)
 
 
-
-
-
 def apply_subdivision_surface(mesh_obj, levels=2, render_levels=2, subdivision_type='CATMULL_CLARK'):
     if mesh_obj.type != 'MESH':
         return
@@ -489,9 +486,7 @@ class Hunyuan3DPaintPipeline:
         position_maps = self.view_processor.render_position_multiview(selected_camera_elevs, selected_camera_azims)
 
         ##########  Style  ###########
-        image_caption = "The hair is jet - black with a sharp side part, showcasing a tapered fade where the sides and back are closely cropped while the top is longer and smoothly styled. Its texture is sleek and polished, with the longer top section holding subtle volume without any bulk."
-        # "high quality"
-        # "From a near-frontal view with the head facing forward and a subtle right tilt, the bare shoulder line is framed by chestnut-brown hair with sun-kissed caramel highlights, falling to mid-shoulder in tight, voluminous curls that create a rounded silhouette around the head. An off-center part sweeps from the left temple, directing dense, defined curls to cascade past the jawline, with some strands curling inward toward the neck and others fanning outward in dynamic, tousled waves that extend slightly beyond the shoulder line."
+        image_caption = "high quality"
         image_style = []
         for image in image_prompt:
             image = image.resize((512, 512))
