@@ -102,115 +102,58 @@ def torch_to_pil(image_tensor: torch.Tensor) -> Image.Image:
     return processed_img_pil
 
 def post_process_mesh(mesh):
+    """
+    Post-process Hunyuan3D mesh output to ensure clean, sharp, watertight geometry with correct normals.
+    """
     if not isinstance(mesh, trimesh.Trimesh):
         raise TypeError("post_process_mesh expects a trimesh.Trimesh instance")
 
-    # Work on a copy to avoid mutating pipeline internals unexpectedly.
-    try:
-        mesh = mesh.copy()
-    except Exception as e:
-        print(f"  Warning: Failed to copy mesh: {e}")
-        print(f"  Working with original mesh (may have side effects)")
-
+    mesh = mesh.copy()
     print(f"  Original mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
     
-    # Initial validation: check for invalid face indices
-    num_vertices = len(mesh.vertices)
-    if len(mesh.faces) > 0:
-        max_face_idx = mesh.faces.max()
-        min_face_idx = mesh.faces.min()
-        if max_face_idx >= num_vertices or min_face_idx < 0:
-            print(f"  Warning: Invalid face indices detected (range: {min_face_idx} to {max_face_idx}, vertices: {num_vertices})")
-            valid_faces_mask = np.all(mesh.faces < num_vertices, axis=1) & np.all(mesh.faces >= 0, axis=1)
-            mesh.update_faces(valid_faces_mask)
-            print(f"  Removed invalid faces -> {len(mesh.faces)} faces remaining")
-
-    # Step 1: Remove duplicate faces using the non-deprecated API.
-    try:
-        unique_faces = mesh.unique_faces()
-        if len(unique_faces) != len(mesh.faces):
-            mesh.update_faces(unique_faces)
-            mesh.remove_unreferenced_vertices()
-            print(f"  Removed duplicate faces -> {len(mesh.faces)} faces")
-    except Exception as e:
-        print(f"  Warning: Failed to remove duplicate faces: {e}")
-
-    # Step 2: Drop degenerate faces that collapse to a line or point.
-    try:
-        nondegenerate_mask = mesh.nondegenerate_faces()
-        if not np.all(nondegenerate_mask):
-            mesh.update_faces(nondegenerate_mask)
-            mesh.remove_unreferenced_vertices()
-            print(f"  Removed degenerate faces -> {len(mesh.faces)} faces")
-    except Exception as e:
-        print(f"  Warning: Failed to remove degenerate faces: {e}")
-
-    # Step 3: Split into connected components and keep the one with largest surface area.
-    try:
-        components = mesh.split(only_watertight=False)
-        if len(components) > 1:
-            print(f"  Found {len(components)} connected components")
-            components = sorted(components, key=lambda m: (m.area, len(m.faces)), reverse=True)
-            mesh = components[0]
-            print(f"  Retained largest component: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
-    except Exception as e:
-        print(f"  Warning: Failed to split components: {e}")
-
-    # Step 4: Repair holes and close small gaps to approach watertightness.
-    try:
-        if not mesh.is_watertight:
-            print("  Mesh is not watertight, attempting repairs...")
-
-            changed = mesh.fill_holes()
-            if changed:
-                print("    Filled holes via fill_holes()")
-
-            if not mesh.is_watertight:
-                mesh.remove_unreferenced_vertices()
-                mesh.merge_vertices()
-                mesh.remove_unreferenced_vertices()
-                mesh.fill_holes()
-    except Exception as e:
-        print(f"  Warning: Failed to repair mesh watertightness: {e}")
-
-    # Step 5: Final cleanup and validation to guarantee consistency.
+    # Step 1: Remove degenerate and duplicate faces
+    nondegenerate_mask = mesh.nondegenerate_faces()
+    if not np.all(nondegenerate_mask):
+        mesh.update_faces(nondegenerate_mask)
+        print(f"  Removed degenerate faces -> {len(mesh.faces)} faces")
+    
+    unique_faces = mesh.unique_faces()
+    if len(unique_faces) != len(mesh.faces):
+        mesh.update_faces(unique_faces)
+        print(f"  Removed duplicate faces -> {len(mesh.faces)} faces")
+    
+    # Step 2: Keep only the largest connected component
+    components = mesh.split(only_watertight=False)
+    if len(components) > 1:
+        print(f"  Found {len(components)} components, keeping largest")
+        mesh = max(components, key=lambda m: m.area)
+        print(f"  Largest component: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+    
+    # Step 3: Merge nearby vertices to clean up topology (preserves sharp edges)
+    mesh.merge_vertices()
     mesh.remove_unreferenced_vertices()
+    
+    # Step 4: Repair holes to make watertight
+    if not mesh.is_watertight:
+        print("  Filling holes to make watertight...")
+        mesh.fill_holes()
+        if mesh.is_watertight:
+            print("  Mesh is now watertight")
+    
+    # Step 5: Fix normal orientation for consistent winding
     mesh.fix_normals()
     
-    # Step 6: Validate face indices to prevent segmentation faults during export
-    # Remove faces with invalid vertex indices
-    num_vertices = len(mesh.vertices)
-    if len(mesh.faces) > 0:
-        valid_faces_mask = np.all(mesh.faces < num_vertices, axis=1) & np.all(mesh.faces >= 0, axis=1)
-        
-        if not np.all(valid_faces_mask):
-            invalid_count = (~valid_faces_mask).sum()
-            print(f"  Warning: Found {invalid_count} faces with invalid vertex indices, removing...")
-            mesh.update_faces(valid_faces_mask)
-            mesh.remove_unreferenced_vertices()
-            print(f"  Cleaned mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+    # Step 6: Final cleanup
+    mesh.remove_unreferenced_vertices()
+    mesh.remove_duplicate_faces()
     
-    # Step 7: Ensure data types are correct (int32 for faces, float for vertices)
-    try:
-        if mesh.faces.dtype != np.int32 and mesh.faces.dtype != np.int64:
-            print(f"  Converting faces from {mesh.faces.dtype} to int32...")
-            mesh.faces = mesh.faces.astype(np.int32)
-        
-        if not np.issubdtype(mesh.vertices.dtype, np.floating):
-            print(f"  Converting vertices from {mesh.vertices.dtype} to float32...")
-            mesh.vertices = mesh.vertices.astype(np.float32)
-    except Exception as e:
-        print(f"  Warning: Failed to fix data types: {e}")
-
-    is_watertight = mesh.is_watertight
-    is_winding_consistent = mesh.is_winding_consistent
-
+    # Step 7: Ensure correct data types
+    mesh.faces = mesh.faces.astype(np.int32)
+    mesh.vertices = mesh.vertices.astype(np.float32)
+    
     print(f"  Final mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
-    print(f"  Watertight: {is_watertight}, Winding consistent: {is_winding_consistent}")
-
-    if not is_watertight:
-        print("  Warning: Mesh could not be made fully watertight, but has been cleaned")
-
+    print(f"  Watertight: {mesh.is_watertight}, Winding consistent: {mesh.is_winding_consistent}")
+    
     return mesh
 
 @torch.inference_mode()
@@ -231,7 +174,7 @@ def run_shape_inference(image_path, output_dir, seed=1234):
     print("Loading Hunyuan3D shape model...")
     model_path = 'tencent/Hunyuan3D-2.1'
     pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)
-    image_processor = ImageProcessorV2(1024, border_ratio=0.1)
+    image_processor = ImageProcessorV2(1024, border_ratio=0.20)
     pipeline.image_processor = image_processor
     
     with Image.open(matted_image_path) as image_pil:
@@ -243,10 +186,10 @@ def run_shape_inference(image_path, output_dir, seed=1234):
     processed_img_pil.save(str(processed_img_path))
     
     # Setup generator
-    generator = torch.Generator(device=pipeline.device).manual_seed(seed)
+    # generator = torch.Generator(device=pipeline.device).manual_seed(seed)
    
     # Check for differentiable marching cubes support
-    if False and _HAS_DISO:
+    if _HAS_DISO:
         mc_algo = 'dmc'
         print("Using differentiable marching cubes (dmc)")
     else:
@@ -258,14 +201,15 @@ def run_shape_inference(image_path, output_dir, seed=1234):
     print("Running shape inference...")
     mesh = pipeline(
         image=str(matted_image_path),
-        generator=generator,
+        # generator=generator,
         output_type='trimesh',
         enable_pbar=True,
-        # guidance_scale=5.0,
-        num_inference_steps=30,
+        guidance_scale=5.0,
+        num_inference_steps=80,
         octree_resolution=512,
+        # box_v=1.01,
         mc_algo=mc_algo,
-        num_chunks=8000,
+        num_chunks=10000,
     )
 
     # Handle output
@@ -289,7 +233,7 @@ def run_shape_inference(image_path, output_dir, seed=1234):
 
     # Post-process mesh: make watertight and keep largest component
     print("Post-processing mesh...")
-    # mesh = post_process_mesh(mesh)
+    mesh = post_process_mesh(mesh)
     
     # Save mesh with error handling
     print(f"Saving mesh to: {mesh_path}")
@@ -569,10 +513,96 @@ def render_mesh(fname, mesh_path, render_dir, resolution=1024):
 
     return front_view_path
 
+def refine_alpha(rgba_u8: np.ndarray, radius: int = 8, eps: float = 1e-4, tiny_feather_sigma: float = 0.5) -> np.ndarray:
+    # return rgba_u8[..., 3]  # Placeholder: skip refinement for now
+    assert rgba_u8.dtype == np.uint8 and rgba_u8.shape[-1] == 4, "Expect uint8 RGBA"
+    rgb_u8 = rgba_u8[..., :3]
+    a_u8   = rgba_u8[..., 3]
+
+    guide_gray_u8 = cv2.cvtColor(rgb_u8, cv2.COLOR_RGBA2GRAY) if rgb_u8.shape[-1] == 4 else \
+                    cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY)
+
+    a_f = a_u8.astype(np.float32) / 255.0
+
+    if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "guidedFilter"):
+        a_ref = cv2.ximgproc.guidedFilter(guide_gray_u8, a_f, radius, eps)
+    else:
+        a8 = (a_f * 255).astype(np.uint8)
+        a8_ref = cv2.bilateralFilter(a8, d=-1, sigmaColor=12, sigmaSpace=4)
+        a_ref = a8_ref.astype(np.float32) / 255.0
+
+    if tiny_feather_sigma and tiny_feather_sigma > 0:
+        a_ref = cv2.GaussianBlur(a_ref, (0, 0), sigmaX=tiny_feather_sigma)
+
+    a_ref_u8 = np.clip(a_ref * 255.0, 0, 255).astype(np.uint8)
+    return a_ref_u8
+
+def center_matted_image(image_path: Path, output_path: Path, bbox_ratio: float = 0.85):
+    """Center foreground object in RGBA image while preserving transparency."""
+    # Load image as RGBA
+    img = Image.open(image_path).convert("RGBA")
+    img_np = np.array(img, dtype=np.uint8)
+    
+    if img_np.shape[2] != 4:
+        raise ValueError(f"Image must have an alpha channel (RGBA), got shape: {img_np.shape}")
+    
+    # Refine alpha channel
+    img_refined = refine_alpha(img_np, radius=10, eps=3e-4, tiny_feather_sigma=0.6)
+    
+    # Split into RGB and alpha
+    rgb = img_np[:, :, :3]
+    alpha = img_refined  # Use refined alpha
+    
+    # Find bounding box of non-transparent pixels
+    coords = cv2.findNonZero(alpha)
+    if coords is None:
+        raise ValueError(f"No foreground region found in image: {image_path}")
+    
+    x, y, w, h = cv2.boundingRect(coords)
+    
+    # Extract foreground region (RGB + alpha)
+    fg_rgb = rgb[y:y+h, x:x+w]
+    fg_alpha = alpha[y:y+h, x:x+w]
+    
+    canvas_h, canvas_w = img_np.shape[:2]
+    
+    # Calculate scale to fit within bbox_ratio of canvas
+    max_size = int(min(canvas_h, canvas_w) * bbox_ratio)
+    scale = min(max_size / w, max_size / h)
+    
+    # Resize if needed
+    if scale < 1.0:
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        fg_rgb = cv2.resize(fg_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        fg_alpha = cv2.resize(fg_alpha, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    else:
+        new_w, new_h = w, h
+    
+    # Create transparent canvas
+    centered_rgb = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    centered_alpha = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+    
+    # Calculate centered position
+    x_offset = (canvas_w - new_w) // 2
+    y_offset = (canvas_h - new_h) // 2
+    
+    # Place foreground in center
+    centered_rgb[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = fg_rgb
+    centered_alpha[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = fg_alpha
+    
+    # Combine RGB and alpha
+    centered_img = np.dstack([centered_rgb, centered_alpha])
+    
+    # Save as PNG (OpenCV uses BGR, so convert)
+    centered_img_bgra = cv2.cvtColor(centered_img, cv2.COLOR_RGBA2BGRA)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), centered_img_bgra)
+
 def run_single_inference(image_name: str, output_dir):
     """Main function to run the shape inference pipeline."""
     fname = image_name
-    matted_image_path = output_dir / 'matted_image' / f'{fname}.png'
+    matted_image_path = output_dir / 'matted_image_centered' / f'{fname}.png'
 
     if not matted_image_path.is_file():
         raise FileNotFoundError(f"Matted image not found: {matted_image_path}")
@@ -609,19 +639,35 @@ def run_single_inference(image_name: str, output_dir):
             mesh_path=textured_mesh_path,
             render_dir=render_dir,
         )
-    
 
 def main(data_dir: str = "/localhome/aha220/Hairdar/modules/Hunyuan3D-2.1/outputs/"):
     output_dir = Path(data_dir)
     matted_images_dir = output_dir / 'matted_image'
+    matted_images_centered_dir = output_dir / 'matted_image_centered'
+    matted_images_centered_dir.mkdir(parents=True, exist_ok=True)
 
     if not matted_images_dir.exists():
         raise FileNotFoundError(f"Matted images directory not found: {matted_images_dir}")
 
+    # First pass: Center all matted images
     for image_file in matted_images_dir.glob("*.png"):
+        image_name = image_file.stem
+        centered_output_path = matted_images_centered_dir / f'{image_name}.png'
+        
+        # if centered_output_path.exists():
+        #     continue
+        
+        center_matted_image(
+            image_path=image_file,
+            output_path=centered_output_path,
+            bbox_ratio=1.0,
+        )
+        
+
+    # Second pass: Run inference on each image
+    image_files = list(matted_images_dir.glob("*.png"))
+    for image_file in sorted(image_files):
         try:
-            if image_file.stem != "hair_113":
-                continue
             run_single_inference(
                 image_name=image_file.stem,
                 output_dir=output_dir
