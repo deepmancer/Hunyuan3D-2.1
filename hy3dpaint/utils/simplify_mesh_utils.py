@@ -21,7 +21,7 @@ def remesh_mesh(mesh_path, remesh_path):
     mesh = mesh_simplify_trimesh(mesh_path, remesh_path)
 
 
-def mesh_simplify_trimesh(inputpath, outputpath, target_count=100000):
+def mesh_simplify_trimesh(inputpath, outputpath, target_count=200000):
     # 先去除离散面
     ms = pymeshlab.MeshSet()
     if inputpath.endswith(".glb"):
