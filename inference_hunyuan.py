@@ -47,6 +47,35 @@ except ImportError:
 except Exception as e:
     print(f"Warning: Failed to apply torchvision fix: {e}")
 
+
+
+import numpy as np
+import torch
+import torch.nn as nn
+from PIL import Image
+
+from ben2 import BEN_Base
+
+torch.set_float32_matmul_precision(['high', 'highest'][0])
+
+class BackgroundRemover:
+    
+    def __init__(self, device: str | torch.device = 'cuda'):
+        self.device = torch.device(device)
+        self.birefnet = self._init_birefnet()
+    
+    def _init_birefnet(self) -> nn.Module:
+        model = BEN_Base.from_pretrained("PramaLLC/BEN2").to(self.device)
+        model.eval()
+        return model
+
+    def remove_background(self, image: Image.Image, refine_foreground: bool = False) -> tuple[Image.Image, Image.Image]:
+        foreground = self.birefnet.inference(image, refine_foreground=refine_foreground)
+        alpha = foreground.getchannel('A')
+        mask = ((np.array(alpha) / 255.0) > 0.85).astype(np.uint8) * 255
+        return foreground, Image.fromarray(mask)
+
+
 def enable_gpus():
     preferences = bpy.context.preferences
     cycles_preferences = preferences.addons["cycles"].preferences
@@ -175,7 +204,7 @@ def run_shape_inference(image_path, output_dir, seed=1234):
     print("Loading Hunyuan3D shape model...")
     model_path = 'tencent/Hunyuan3D-2.1'
     pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)
-    image_processor = ImageProcessorV2(1024, border_ratio=0.0)
+    image_processor = ImageProcessorV2(2048, border_ratio=0.0)
     pipeline.image_processor = image_processor
     
     with Image.open(matted_image_path) as image_pil:
@@ -205,9 +234,9 @@ def run_shape_inference(image_path, output_dir, seed=1234):
         # generator=generator,
         output_type='trimesh',
         enable_pbar=True,
-        guidance_scale=6.0,
+        guidance_scale=5.5,
         num_inference_steps=80,
-        octree_resolution=768,
+        octree_resolution=512,
         # box_v=1.01,
         mc_algo=mc_algo,
         num_chunks=20000,
@@ -275,7 +304,7 @@ def run_shape_inference(image_path, output_dir, seed=1234):
     }
 
 @torch.inference_mode()
-def run_texture_inference(image_path, mesh_path, output_dir, max_num_view=8, resolution=1024):
+def run_texture_inference(image_path, mesh_path, output_dir, max_num_view=6, resolution=1024):
     output_dir = Path(output_dir)
     image_path = Path(image_path)
     mesh_path = Path(mesh_path)
@@ -543,7 +572,7 @@ def center_matted_image(image_path: Path, output_path: Path, bbox_ratio: float =
     # Load image as RGBA
     img = Image.open(image_path).convert("RGBA")
     img_np = np.array(img, dtype=np.uint8)
-    
+    background_remover = BackgroundRemover()
     if img_np.shape[2] != 4:
         raise ValueError(f"Image must have an alpha channel (RGBA), got shape: {img_np.shape}")
     
@@ -640,13 +669,39 @@ def center_matted_image(image_path: Path, output_path: Path, bbox_ratio: float =
     
     # Combine RGB and alpha
     centered_img = np.dstack([centered_rgb, centered_alpha])
+    # Convert to RGB PIL Image (removing alpha channel)
+    centered_img_pil = Image.fromarray(centered_img)
+    centered_img_rgb = centered_img_pil.convert("RGB")
+    centered_image_rgba, centered_image_mask = background_remover.remove_background(centered_img_rgb, refine_foreground=True)
     
-    # Save as PNG (OpenCV uses BGR, so convert)
-    centered_img_bgra = cv2.cvtColor(centered_img, cv2.COLOR_RGBA2BGRA)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(output_path), centered_img_bgra)
+    
+    # # Ensure only the largest connected component is kept in the mask
+    centered_mask_np = np.array(centered_image_mask, dtype=np.uint8)
 
-def run_single_inference(image_name: str, output_dir):
+    # # Find all connected components
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(centered_mask_np, connectivity=8)
+
+    if num_labels > 2:  # More than just background (label 0) and one foreground component
+        # Find the largest component (excluding background at label 0)
+        largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        
+        # Create new mask with only the largest component
+        centered_mask_np = (labels == largest_label).astype(np.uint8) * 255
+        
+        print(f"  Removed {num_labels - 2} smaller connected components, keeping largest foreground region")
+
+    # Apply the cleaned mask to the RGBA image
+    centered_image_rgba_np = np.array(centered_image_rgba, dtype=np.uint8)
+    centered_image_rgba_np[..., 3] = centered_mask_np 
+    # Set background pixels (where mask is 0) to white
+    centered_image_rgba_np[centered_mask_np == 0, :3] = 255
+    centered_image_rgba = Image.fromarray(centered_image_rgba_np)
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    centered_image_rgba.save(output_path)
+    print(f"Saved centered matted image to: {output_path}")
+
+def run_single_inference(image_name: str, output_dir, force_recompute: bool = False):
     """Main function to run the shape inference pipeline."""
     fname = image_name
     matted_image_path = output_dir / 'matted_image_centered' / f'{fname}.png'
@@ -657,7 +712,7 @@ def run_single_inference(image_name: str, output_dir):
     mesh_path = output_dir / 'shape_mesh' / f'{fname}.glb'
     textured_mesh_path = output_dir / 'textured_mesh' / fname / 'textured_mesh.glb'
 
-    if mesh_path.exists():
+    if mesh_path.exists() and not force_recompute:
         print(f"Mesh already exists at {mesh_path}, skipping shape inference.")
     else:
         seed = int(time.time())
@@ -667,7 +722,7 @@ def run_single_inference(image_name: str, output_dir):
             seed=seed
         )
 
-    if textured_mesh_path.exists():
+    if textured_mesh_path.exists() and not force_recompute:
         print(f"Textured mesh already exists at {textured_mesh_path}, skipping texture inference.")
     else:
         textured_mesh_path = run_texture_inference(
@@ -679,7 +734,7 @@ def run_single_inference(image_name: str, output_dir):
     render_dir = output_dir / 'render'
     render_dir.mkdir(parents=True, exist_ok=True)
 
-    if (render_dir / f'{fname}.png').exists():
+    if (render_dir / f'{fname}.png').exists() and not force_recompute:
         print(f"Rendered image already exists at {render_dir / f'{fname}.png'}, skipping rendering.")
     else:
         render_mesh(
@@ -690,7 +745,7 @@ def run_single_inference(image_name: str, output_dir):
 
 def main(data_dir: str = "/workspace/outputs"):
     output_dir = Path(data_dir)
-    matted_images_dir = output_dir / 'matted_image'
+    matted_images_dir = output_dir / 'image'
     matted_images_centered_dir = output_dir / 'matted_image_centered'
     matted_images_centered_dir.mkdir(parents=True, exist_ok=True)
 
@@ -701,26 +756,32 @@ def main(data_dir: str = "/workspace/outputs"):
     for image_file in matted_images_dir.glob("*.png"):
         image_name = image_file.stem
         centered_output_path = matted_images_centered_dir / f'{image_name}.png'
+        render_image_output_path = output_dir / 'render' / f'{image_file.stem}.png'
         
-        if centered_output_path.exists():
+        if render_image_output_path.exists():
             continue
-        
+
         center_matted_image(
             image_path=image_file,
             output_path=centered_output_path,
-            bbox_ratio=0.9,
+            bbox_ratio=0.80,
         )
         
     import random
     # Second pass: Run inference on each image
-    image_files = list(matted_images_dir.glob("*.png"))
+    image_files = list(matted_images_centered_dir.glob("*.png"))
     random.shuffle(image_files)
     for image_file in image_files:
+        render_image_output_path = output_dir / 'render' / f'{image_file.stem}.png'
+        if render_image_output_path.exists():
+            print(f"Rendered image already exists at {render_image_output_path}, skipping inference.")
+            continue
         try:
             print(f"Processing image: {image_file}")
             run_single_inference(
                 image_name=image_file.stem,
-                output_dir=output_dir
+                output_dir=output_dir,
+                force_recompute=True,
             )
         except Exception as e:
             print(f"Error processing {image_file}: {e}")
