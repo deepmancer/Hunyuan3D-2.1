@@ -51,7 +51,7 @@ class ImageProcessorV2:
             mask = np.ones_like(image[..., 0:1]) * 255
             image = np.concatenate([image, mask], axis=-1)
             mask = mask[..., 0]
-
+        return image, mask
         H, W, C = image.shape
 
         size = max(H, W)

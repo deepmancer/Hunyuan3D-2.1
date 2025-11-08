@@ -778,9 +778,6 @@ def main(data_dir: str = "/workspace/outputs"):
             continue
         try:
             print(f"Processing image: {image_file}")
-            if image_file.stem == "sample_135":
-                print("Skipping sample_135 due to known issues.")
-                continue
             run_single_inference(
                 image_name=image_file.stem,
                 output_dir=output_dir,
