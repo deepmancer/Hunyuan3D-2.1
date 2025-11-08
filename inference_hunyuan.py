@@ -9,6 +9,7 @@ try:
     import bpy  # noqa: F401  # Optional: available only inside Blender
 except ImportError:
     bpy = None
+import time
 
 # --- Path setup ---
 ROOT_DIR = Path(__file__).resolve().parent
@@ -45,6 +46,35 @@ except ImportError:
     print("Warning: torchvision_fix module not found, proceeding without compatibility fix")                                      
 except Exception as e:
     print(f"Warning: Failed to apply torchvision fix: {e}")
+
+
+
+import numpy as np
+import torch
+import torch.nn as nn
+from PIL import Image
+
+from ben2 import BEN_Base
+
+torch.set_float32_matmul_precision(['high', 'highest'][0])
+
+class BackgroundRemover:
+    
+    def __init__(self, device: str | torch.device = 'cuda'):
+        self.device = torch.device(device)
+        self.birefnet = self._init_birefnet()
+    
+    def _init_birefnet(self) -> nn.Module:
+        model = BEN_Base.from_pretrained("PramaLLC/BEN2").to(self.device)
+        model.eval()
+        return model
+
+    def remove_background(self, image: Image.Image, refine_foreground: bool = False) -> tuple[Image.Image, Image.Image]:
+        foreground = self.birefnet.inference(image, refine_foreground=refine_foreground)
+        alpha = foreground.getchannel('A')
+        mask = ((np.array(alpha) / 255.0) > 0.85).astype(np.uint8) * 255
+        return foreground, Image.fromarray(mask)
+
 
 def enable_gpus():
     preferences = bpy.context.preferences
@@ -174,7 +204,7 @@ def run_shape_inference(image_path, output_dir, seed=1234):
     print("Loading Hunyuan3D shape model...")
     model_path = 'tencent/Hunyuan3D-2.1'
     pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)
-    image_processor = ImageProcessorV2(1024, border_ratio=0.20)
+    image_processor = ImageProcessorV2(2048, border_ratio=0.0)
     pipeline.image_processor = image_processor
     
     with Image.open(matted_image_path) as image_pil:
@@ -204,12 +234,12 @@ def run_shape_inference(image_path, output_dir, seed=1234):
         # generator=generator,
         output_type='trimesh',
         enable_pbar=True,
-        guidance_scale=5.0,
+        guidance_scale=5.5,
         num_inference_steps=80,
         octree_resolution=512,
         # box_v=1.01,
         mc_algo=mc_algo,
-        num_chunks=10000,
+        num_chunks=20000,
     )
 
     # Handle output
@@ -274,7 +304,7 @@ def run_shape_inference(image_path, output_dir, seed=1234):
     }
 
 @torch.inference_mode()
-def run_texture_inference(image_path, mesh_path, output_dir, max_num_view=6, resolution=768):
+def run_texture_inference(image_path, mesh_path, output_dir, max_num_view=6, resolution=1024):
     output_dir = Path(output_dir)
     image_path = Path(image_path)
     mesh_path = Path(mesh_path)
@@ -286,8 +316,8 @@ def run_texture_inference(image_path, mesh_path, output_dir, max_num_view=6, res
     # Initialize paint pipeline
     print("Loading Hunyuan3D paint pipeline...")
     conf = Hunyuan3DPaintConfig(max_num_view, resolution)
-    conf.multiview_cfg_path = "/localhome/aha220/Hairdar/modules/Hunyuan3D-2.1/hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
-    conf.custom_pipeline = "/localhome/aha220/Hairdar/modules/Hunyuan3D-2.1/hy3dpaint/hunyuanpaintpbr"
+    conf.multiview_cfg_path = "/workspace/Hairdar/modules/Hunyuan3D-2.1/hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
+    conf.custom_pipeline = "/workspace/Hairdar/modules/Hunyuan3D-2.1/hy3dpaint/hunyuanpaintpbr"
     paint_pipeline = Hunyuan3DPaintPipeline(conf)
     
     textured_mesh_path = textured_mesh_dir / 'textured_mesh.glb'
@@ -542,21 +572,67 @@ def center_matted_image(image_path: Path, output_path: Path, bbox_ratio: float =
     # Load image as RGBA
     img = Image.open(image_path).convert("RGBA")
     img_np = np.array(img, dtype=np.uint8)
-    
+    background_remover = BackgroundRemover()
     if img_np.shape[2] != 4:
         raise ValueError(f"Image must have an alpha channel (RGBA), got shape: {img_np.shape}")
     
-    # Refine alpha channel
-    img_refined = refine_alpha(img_np, radius=10, eps=3e-4, tiny_feather_sigma=0.6)
+    # Load silhouette mask from silhouette_mask folder
+    image_stem = image_path.stem
+    silhouette_mask_dir = image_path.parent.parent / 'silhouette_mask'
+    silhouette_mask_path = silhouette_mask_dir / f'{image_stem}.png'
     
-    # Split into RGB and alpha
+    if not silhouette_mask_path.exists():
+        raise FileNotFoundError(f"Silhouette mask not found: {silhouette_mask_path}")
+    
+    # Load silhouette mask as grayscale
+    silh_mask = Image.open(silhouette_mask_path).convert("L")
+    silh_mask_np = np.array(silh_mask, dtype=np.uint8)
+    
+    # Verify mask dimensions match image dimensions
+    if silh_mask_np.shape[:2] != img_np.shape[:2]:
+        raise ValueError(f"Silhouette mask dimensions {silh_mask_np.shape[:2]} do not match image dimensions {img_np.shape[:2]}")
+    
+    # Split into RGB and use silhouette mask as alpha
     rgb = img_np[:, :, :3]
-    alpha = img_refined  # Use refined alpha
+    alpha = silh_mask_np  # Use silhouette mask as foreground mask
     
-    # Find bounding box of non-transparent pixels
+    canvas_h, canvas_w = img_np.shape[:2]
+    
+    # STEP 1: First, align the foreground to the bottom of the canvas
+    # Find bounding box of non-transparent pixels in original image
     coords = cv2.findNonZero(alpha)
     if coords is None:
         raise ValueError(f"No foreground region found in image: {image_path}")
+    
+    x_orig, y_orig, w_orig, h_orig = cv2.boundingRect(coords)
+    
+    # Find the bottom-most non-transparent row in the original image
+    nonzero_rows = np.where(np.any(alpha > 0, axis=1))[0]
+    if len(nonzero_rows) == 0:
+        raise ValueError(f"No non-transparent pixels found in image")
+    
+    bottom_row_orig = nonzero_rows[-1]
+    padding_below_orig = (canvas_h - 1) - bottom_row_orig
+    
+    # If there's padding at the bottom, shift the entire image up to remove it
+    if padding_below_orig > 0:
+        # Create new arrays for bottom-aligned image
+        rgb_bottom_aligned = np.zeros_like(rgb)
+        alpha_bottom_aligned = np.zeros_like(alpha)
+        
+        # Shift everything down by padding_below_orig
+        rgb_bottom_aligned[padding_below_orig:, :] = rgb[:-padding_below_orig, :]
+        alpha_bottom_aligned[padding_below_orig:, :] = alpha[:-padding_below_orig, :]
+        
+        # Update rgb and alpha to use bottom-aligned versions
+        rgb = rgb_bottom_aligned
+        alpha = alpha_bottom_aligned
+    
+    # STEP 2: Now work with the bottom-aligned image
+    # Find bounding box of non-transparent pixels after bottom alignment
+    coords = cv2.findNonZero(alpha)
+    if coords is None:
+        raise ValueError(f"No foreground region found after bottom alignment")
     
     x, y, w, h = cv2.boundingRect(coords)
     
@@ -583,23 +659,49 @@ def center_matted_image(image_path: Path, output_path: Path, bbox_ratio: float =
     centered_rgb = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
     centered_alpha = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
     
-    # Calculate centered position
-    x_offset = (canvas_w - new_w) // 2
-    y_offset = (canvas_h - new_h) // 2
+    # STEP 3: Place the foreground centered horizontally and at the bottom vertically
+    x_offset = (canvas_w - new_w) // 2  # Center horizontally (equal left/right padding)
+    y_offset = canvas_h - new_h  # Align to bottom (foreground already bottom-aligned from Step 1)
     
-    # Place foreground in center
+    # Place foreground with horizontal centering and bottom alignment
     centered_rgb[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = fg_rgb
     centered_alpha[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = fg_alpha
     
     # Combine RGB and alpha
     centered_img = np.dstack([centered_rgb, centered_alpha])
+    # Convert to RGB PIL Image (removing alpha channel)
+    centered_img_pil = Image.fromarray(centered_img)
+    centered_img_rgb = centered_img_pil.convert("RGB")
+    centered_image_rgba, centered_image_mask = background_remover.remove_background(centered_img_rgb, refine_foreground=True)
     
-    # Save as PNG (OpenCV uses BGR, so convert)
-    centered_img_bgra = cv2.cvtColor(centered_img, cv2.COLOR_RGBA2BGRA)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(output_path), centered_img_bgra)
+    
+    # # Ensure only the largest connected component is kept in the mask
+    centered_mask_np = np.array(centered_image_mask, dtype=np.uint8)
 
-def run_single_inference(image_name: str, output_dir):
+    # # Find all connected components
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(centered_mask_np, connectivity=8)
+
+    if num_labels > 2:  # More than just background (label 0) and one foreground component
+        # Find the largest component (excluding background at label 0)
+        largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        
+        # Create new mask with only the largest component
+        centered_mask_np = (labels == largest_label).astype(np.uint8) * 255
+        
+        print(f"  Removed {num_labels - 2} smaller connected components, keeping largest foreground region")
+
+    # Apply the cleaned mask to the RGBA image
+    centered_image_rgba_np = np.array(centered_image_rgba, dtype=np.uint8)
+    centered_image_rgba_np[..., 3] = centered_mask_np 
+    # Set background pixels (where mask is 0) to white
+    centered_image_rgba_np[centered_mask_np == 0, :3] = 255
+    centered_image_rgba = Image.fromarray(centered_image_rgba_np)
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    centered_image_rgba.save(output_path)
+    print(f"Saved centered matted image to: {output_path}")
+
+def run_single_inference(image_name: str, output_dir, force_recompute: bool = False):
     """Main function to run the shape inference pipeline."""
     fname = image_name
     matted_image_path = output_dir / 'matted_image_centered' / f'{fname}.png'
@@ -610,16 +712,17 @@ def run_single_inference(image_name: str, output_dir):
     mesh_path = output_dir / 'shape_mesh' / f'{fname}.glb'
     textured_mesh_path = output_dir / 'textured_mesh' / fname / 'textured_mesh.glb'
 
-    if mesh_path.exists():
+    if mesh_path.exists() and not force_recompute:
         print(f"Mesh already exists at {mesh_path}, skipping shape inference.")
     else:
+        seed = int(time.time())
         run_shape_inference(
             image_path=str(matted_image_path),
             output_dir=str(output_dir),
-            seed=32
+            seed=seed
         )
 
-    if textured_mesh_path.exists():
+    if textured_mesh_path.exists() and not force_recompute:
         print(f"Textured mesh already exists at {textured_mesh_path}, skipping texture inference.")
     else:
         textured_mesh_path = run_texture_inference(
@@ -631,7 +734,7 @@ def run_single_inference(image_name: str, output_dir):
     render_dir = output_dir / 'render'
     render_dir.mkdir(parents=True, exist_ok=True)
 
-    if (render_dir / f'{fname}.png').exists():
+    if (render_dir / f'{fname}.png').exists() and not force_recompute:
         print(f"Rendered image already exists at {render_dir / f'{fname}.png'}, skipping rendering.")
     else:
         render_mesh(
@@ -640,9 +743,9 @@ def run_single_inference(image_name: str, output_dir):
             render_dir=render_dir,
         )
 
-def main(data_dir: str = "/localhome/aha220/Hairdar/modules/Hunyuan3D-2.1/outputs/"):
+def main(data_dir: str = "/workspace/outputs"):
     output_dir = Path(data_dir)
-    matted_images_dir = output_dir / 'matted_image'
+    matted_images_dir = output_dir / 'image'
     matted_images_centered_dir = output_dir / 'matted_image_centered'
     matted_images_centered_dir.mkdir(parents=True, exist_ok=True)
 
@@ -653,24 +756,35 @@ def main(data_dir: str = "/localhome/aha220/Hairdar/modules/Hunyuan3D-2.1/output
     for image_file in matted_images_dir.glob("*.png"):
         image_name = image_file.stem
         centered_output_path = matted_images_centered_dir / f'{image_name}.png'
+        render_image_output_path = output_dir / 'render' / f'{image_file.stem}.png'
         
-        # if centered_output_path.exists():
-        #     continue
-        
+        if render_image_output_path.exists():
+            continue
+
         center_matted_image(
             image_path=image_file,
             output_path=centered_output_path,
-            bbox_ratio=1.0,
+            bbox_ratio=0.80,
         )
         
-
+    import random
     # Second pass: Run inference on each image
-    image_files = list(matted_images_dir.glob("*.png"))
-    for image_file in sorted(image_files):
+    image_files = list(matted_images_centered_dir.glob("*.png"))
+    random.shuffle(image_files)
+    for image_file in image_files:
+        render_image_output_path = output_dir / 'render' / f'{image_file.stem}.png'
+        if render_image_output_path.exists():
+            print(f"Rendered image already exists at {render_image_output_path}, skipping inference.")
+            continue
         try:
+            print(f"Processing image: {image_file}")
+            if image_file.stem == "sample_135":
+                print("Skipping sample_135 due to known issues.")
+                continue
             run_single_inference(
                 image_name=image_file.stem,
-                output_dir=output_dir
+                output_dir=output_dir,
+                force_recompute=True,
             )
         except Exception as e:
             print(f"Error processing {image_file}: {e}")
