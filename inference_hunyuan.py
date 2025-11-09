@@ -1,147 +1,174 @@
-import os
-import sys
-import warnings
+import argparse
 import gc
 import math
+import os
+import random
+import sys
+import time
 from pathlib import Path
 
+import numpy as np
+import torch
+import torch.nn as nn
+import trimesh
+from ben2 import BEN_Base
+from PIL import Image
+
 try:
-    import bpy  # noqa: F401  # Optional: available only inside Blender
+    import bpy
 except ImportError:
     bpy = None
-import time
 
-# --- Path setup ---
 ROOT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, "modules/Hunyuan3D-2.1")
 sys.path.insert(0, str(ROOT_DIR / 'hy3dpaint'))
 sys.path.insert(0, str(ROOT_DIR / 'hy3dshape'))
 
-# --- Third-party imports ---
-import cv2
-import numpy as np
-import torch
-import torch.nn as nn
-import trimesh
-from PIL import Image
-from trimesh import repair
-
-# --- Local imports ---
 from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
-from hy3dshape.preprocessors import ImageProcessorV2, array_to_tensor
+from hy3dshape.preprocessors import ImageProcessorV2
 from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
 
 try:
-    import diso  # noqa: F401  # Optional dependency
+    import diso
     _HAS_DISO = True
 except ImportError:
     _HAS_DISO = False
-
-# torch.set_float32_matmul_precision('high')
 
 try:
     from torchvision_fix import apply_fix
     apply_fix()
 except ImportError:
-    print("Warning: torchvision_fix module not found, proceeding without compatibility fix")                                      
+    print("Warning: torchvision_fix module not found, proceeding without compatibility fix")
 except Exception as e:
     print(f"Warning: Failed to apply torchvision fix: {e}")
 
 
-
-import numpy as np
-import torch
-import torch.nn as nn
-from PIL import Image
-
-from ben2 import BEN_Base
-
-torch.set_float32_matmul_precision(['high', 'highest'][0])
-
 class BackgroundRemover:
-    
-    def __init__(self, device: str | torch.device = 'cuda'):
+    def __init__(self, device='cuda'):
         self.device = torch.device(device)
         self.birefnet = self._init_birefnet()
     
-    def _init_birefnet(self) -> nn.Module:
+    def _init_birefnet(self):
         model = BEN_Base.from_pretrained("PramaLLC/BEN2").to(self.device)
         model.eval()
         return model
 
-    def remove_background(self, image: Image.Image, refine_foreground: bool = False) -> tuple[Image.Image, Image.Image]:
+    def remove_background(self, image, refine_foreground=False):
         foreground = self.birefnet.inference(image, refine_foreground=refine_foreground)
         alpha = foreground.getchannel('A')
         mask = ((np.array(alpha) / 255.0) > 0.85).astype(np.uint8) * 255
         return foreground, Image.fromarray(mask)
 
 
-def enable_gpus():
+def enable_gpus(max_gpus=None):
     preferences = bpy.context.preferences
     cycles_preferences = preferences.addons["cycles"].preferences
     cycles_preferences.refresh_devices()
-    devices = list(cycles_preferences.devices)[:2]
-
+    
+    available_types = []
+    try:
+        for compute_type in ['OPTIX', 'HIP', 'CUDA', 'METAL', 'OPENCL']:
+            try:
+                cycles_preferences.compute_device_type = compute_type
+                cycles_preferences.refresh_devices()
+                gpu_devices = [d for d in cycles_preferences.devices if d.type != 'CPU']
+                if gpu_devices:
+                    available_types.append((compute_type, len(gpu_devices)))
+                    print(f"Found {len(gpu_devices)} GPU(s) for {compute_type}")
+            except (AttributeError, TypeError):
+                continue
+    except Exception as e:
+        print(f"Warning during device detection: {e}")
+    
+    if not available_types:
+        raise RuntimeError("No GPU compute devices available. Falling back to CPU is not implemented.")
+    
+    compute_type_priority = {
+        'OPTIX': 3,
+        'CUDA': 4,
+        'HIP': 2,
+        'METAL': 1,
+        'OPENCL': 0
+    }
+    
+    available_types.sort(key=lambda x: compute_type_priority.get(x[0], -1), reverse=True)
+    selected_type = available_types[0][0]
+    
+    cycles_preferences.compute_device_type = selected_type
+    cycles_preferences.refresh_devices()
+    
+    gpu_devices = [d for d in cycles_preferences.devices if d.type != 'CPU']
+    if gpu_devices and selected_type == 'OPTIX':
+        compute_gpu_indicators = ['H100', 'A100', 'A40', 'A30', 'A10', 'V100', 'P100', 'Tesla']
+        for device in gpu_devices:
+            if any(indicator in device.name for indicator in compute_gpu_indicators):
+                if 'CUDA' in [t[0] for t in available_types]:
+                    selected_type = 'CUDA'
+                    print(f"Detected compute GPU ({device.name}), switching from OPTIX to CUDA for better performance")
+                    break
+    
+    cycles_preferences.compute_device_type = selected_type
+    cycles_preferences.refresh_devices()
+    
+    all_devices = cycles_preferences.devices
+    gpu_devices = [d for d in all_devices if d.type != 'CPU']
+    
+    if not gpu_devices:
+        raise RuntimeError(f"No GPU devices found for {selected_type}")
+    
+    devices_to_use = gpu_devices if max_gpus is None else gpu_devices[:max_gpus]
+    
     activated_gpus = []
-
-    for device in devices:
-        device.use = True
-        activated_gpus.append(device.name)
-
-    cycles_preferences.compute_device_type = 'OPTIX'
+    for device in all_devices:
+        if device in devices_to_use:
+            device.use = True
+            activated_gpus.append(device.name)
+            print(f"Activated GPU: {device.name}")
+        else:
+            device.use = False
+    
     bpy.context.scene.cycles.device = "GPU"
     bpy.context.scene.cycles.use_persistent_data = True
+    
+    return {'gpus': activated_gpus, 'compute_type': selected_type}
 
-    return activated_gpus
+def torch_to_pil(image_tensor):
+    if not isinstance(image_tensor, torch.Tensor):
+        return image_tensor
+    
+    processed_img_np = image_tensor.detach().cpu().numpy()
 
-def torch_to_pil(image_tensor: torch.Tensor) -> Image.Image:
-    # Convert torch tensor to a PIL-friendly numpy array
-    if isinstance(image_tensor, torch.Tensor):
-        processed_img_np = image_tensor.detach().cpu().numpy()
+    while processed_img_np.ndim > 3 and processed_img_np.shape[0] == 1:
+        processed_img_np = np.squeeze(processed_img_np, axis=0)
 
-        # Remove leading singleton batch dimensions
-        while processed_img_np.ndim > 3 and processed_img_np.shape[0] == 1:
-            processed_img_np = np.squeeze(processed_img_np, axis=0)
+    if processed_img_np.ndim == 3:
+        if processed_img_np.shape[0] in (1, 3, 4):
+            processed_img_np = np.transpose(processed_img_np, (1, 2, 0))
+        if processed_img_np.shape[-1] == 1:
+            processed_img_np = processed_img_np[..., 0]
+    elif processed_img_np.ndim == 4:
+        raise ValueError(
+            f"Processed image has unexpected shape {processed_img_np.shape}; could not squeeze batch dimension"
+        )
 
-        if processed_img_np.ndim == 3:
-            # Channel-first tensor (C, H, W)
-            if processed_img_np.shape[0] in (1, 3, 4):
-                processed_img_np = np.transpose(processed_img_np, (1, 2, 0))
-            # If channel dimension is the last axis and is singleton, squeeze it
-            if processed_img_np.shape[-1] == 1:
-                processed_img_np = processed_img_np[..., 0]
+    processed_img_np = processed_img_np.astype(np.float32)
+    img_min, img_max = processed_img_np.min(), processed_img_np.max()
+    if img_max <= 1.0 and img_min >= 0.0:
+        processed_img_np = processed_img_np * 255.0
+    elif img_max <= 1.0 and img_min >= -1.0:
+        processed_img_np = ((processed_img_np + 1.0) * 0.5) * 255.0
 
-        elif processed_img_np.ndim == 4:
-            raise ValueError(
-                f"Processed image has unexpected shape {processed_img_np.shape}; could not squeeze batch dimension"
-            )
+    processed_img_np = np.clip(processed_img_np, 0, 255).astype(np.uint8)
 
-        # Normalize value range to [0, 255]
-        processed_img_np = processed_img_np.astype(np.float32)
-        img_min, img_max = processed_img_np.min(), processed_img_np.max()
-        if img_max <= 1.0 and img_min >= 0.0:
-            processed_img_np = processed_img_np * 255.0
-        elif img_max <= 1.0 and img_min >= -1.0:
-            processed_img_np = ((processed_img_np + 1.0) * 0.5) * 255.0
-
-        processed_img_np = np.clip(processed_img_np, 0, 255).astype(np.uint8)
-
-        processed_img_pil = Image.fromarray(processed_img_np)
-    else:
-        processed_img_pil = image_tensor
-    return processed_img_pil
+    return Image.fromarray(processed_img_np)
 
 def post_process_mesh(mesh):
-    """
-    Post-process Hunyuan3D mesh output to ensure clean, sharp, watertight geometry with correct normals.
-    """
     if not isinstance(mesh, trimesh.Trimesh):
         raise TypeError("post_process_mesh expects a trimesh.Trimesh instance")
 
     mesh = mesh.copy()
     print(f"  Original mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
     
-    # Step 1: Remove degenerate and duplicate faces
     nondegenerate_mask = mesh.nondegenerate_faces()
     if not np.all(nondegenerate_mask):
         mesh.update_faces(nondegenerate_mask)
@@ -152,32 +179,25 @@ def post_process_mesh(mesh):
         mesh.update_faces(unique_faces)
         print(f"  Removed duplicate faces -> {len(mesh.faces)} faces")
     
-    # Step 2: Keep only the largest connected component
     components = mesh.split(only_watertight=False)
     if len(components) > 1:
         print(f"  Found {len(components)} components, keeping largest")
         mesh = max(components, key=lambda m: m.area)
         print(f"  Largest component: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
     
-    # Step 3: Merge nearby vertices to clean up topology (preserves sharp edges)
     mesh.merge_vertices()
     mesh.remove_unreferenced_vertices()
     
-    # Step 4: Repair holes to make watertight
     if not mesh.is_watertight:
         print("  Filling holes to make watertight...")
         mesh.fill_holes()
         if mesh.is_watertight:
             print("  Mesh is now watertight")
     
-    # Step 5: Fix normal orientation for consistent winding
     mesh.fix_normals()
-    
-    # Step 6: Final cleanup
     mesh.remove_unreferenced_vertices()
     mesh.remove_duplicate_faces()
     
-    # Step 7: Ensure correct data types
     mesh.faces = mesh.faces.astype(np.int32)
     mesh.vertices = mesh.vertices.astype(np.float32)
     
@@ -191,20 +211,20 @@ def run_shape_inference(image_path, output_dir, seed=1234):
     image_name = os.path.splitext(os.path.basename(image_path))[0]
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    shape_mesh_dir = output_dir / 'shape_mesh'
+
+    shape_mesh_dir = output_dir / "hunyuannn" / image_name
+    shape_mesh_dir.mkdir(parents=True, exist_ok=True)
     preprocessed_img_dir = output_dir / 'preprocessed_image'
     shape_mesh_dir.mkdir(exist_ok=True)
     preprocessed_img_dir.mkdir(exist_ok=True)
     
-    mesh_path = shape_mesh_dir / f'{image_name}.glb'
+    mesh_path = shape_mesh_dir / 'shape_mesh.glb'
     matted_image_path = Path(image_path)
 
-    # Load shape pipeline
     print("Loading Hunyuan3D shape model...")
     model_path = 'tencent/Hunyuan3D-2.1'
     pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(model_path)
-    image_processor = ImageProcessorV2(2048, border_ratio=0.0)
+    image_processor = ImageProcessorV2(1024, border_ratio=0.0)
     pipeline.image_processor = image_processor
     
     with Image.open(matted_image_path) as image_pil:
@@ -215,10 +235,8 @@ def run_shape_inference(image_path, output_dir, seed=1234):
     processed_img_pil = torch_to_pil(processed_img)
     processed_img_pil.save(str(processed_img_path))
     
-    # Setup generator
-    # generator = torch.Generator(device=pipeline.device).manual_seed(seed)
+    generator = torch.Generator(device=pipeline.device).manual_seed(seed)
    
-    # Check for differentiable marching cubes support
     if _HAS_DISO:
         mc_algo = 'dmc'
         print("Using differentiable marching cubes (dmc)")
@@ -227,29 +245,25 @@ def run_shape_inference(image_path, output_dir, seed=1234):
         print("Warning: diso package not found. Using standard marching cubes.")
         print("Install with `pip install diso` to enable differentiable marching cubes.")
     
-    # Run inference
     print("Running shape inference...")
     mesh = pipeline(
         image=str(matted_image_path),
-        # generator=generator,
+        generator=generator,
         output_type='trimesh',
         enable_pbar=True,
         guidance_scale=5.5,
-        num_inference_steps=80,
-        octree_resolution=512,
-        # box_v=1.01,
+        num_inference_steps=50,
+        octree_resolution=384,
         mc_algo=mc_algo,
         num_chunks=20000,
     )
 
-    # Handle output
     if isinstance(mesh, (list, tuple)):
         mesh = mesh[0]
     
     if mesh is None:
         raise RuntimeError("Mesh generation failed; check the input images and GPU memory availability")
     
-    # Validate mesh before post-processing
     if not isinstance(mesh, trimesh.Trimesh):
         raise TypeError(f"Expected trimesh.Trimesh, got {type(mesh)}")
     
@@ -261,29 +275,23 @@ def run_shape_inference(image_path, output_dir, seed=1234):
     
     print(f"Generated mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
 
-    # Post-process mesh: make watertight and keep largest component
     print("Post-processing mesh...")
     mesh = post_process_mesh(mesh)
     
-    # Save mesh with error handling
     print(f"Saving mesh to: {mesh_path}")
     try:
-        # Validate mesh before export
         if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
             raise ValueError("Mesh has no vertices or faces after post-processing")
         
-        # Attempt export
         mesh.export(mesh_path)
         print(f"  Successfully saved mesh to {mesh_path}")
     except Exception as e:
         print(f"  Error during mesh export: {e}")
         print(f"  Attempting fallback export to OBJ format...")
         try:
-            # Fallback: try OBJ format which is more forgiving
             fallback_path = mesh_path.with_suffix('.obj')
             mesh.export(fallback_path)
             print(f"  Saved as OBJ format to: {fallback_path}")
-            # Update mesh_path for return value
             mesh_path = fallback_path
         except Exception as fallback_error:
             print(f"  Fallback export also failed: {fallback_error}")
@@ -304,16 +312,15 @@ def run_shape_inference(image_path, output_dir, seed=1234):
     }
 
 @torch.inference_mode()
-def run_texture_inference(image_path, mesh_path, output_dir, max_num_view=6, resolution=1024):
+def run_texture_inference(image_path, shape_mesh_path, output_dir, max_num_view=4, resolution=512):
     output_dir = Path(output_dir)
     image_path = Path(image_path)
-    mesh_path = Path(mesh_path)
+    shape_mesh_path = Path(shape_mesh_path)
 
     image_name = image_path.stem
-    textured_mesh_dir = output_dir / 'textured_mesh' / image_name
+    textured_mesh_dir = output_dir / "hunyuannn" / image_name
     textured_mesh_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize paint pipeline
     print("Loading Hunyuan3D paint pipeline...")
     conf = Hunyuan3DPaintConfig(max_num_view, resolution)
     conf.multiview_cfg_path = "/workspace/Hairdar/modules/Hunyuan3D-2.1/hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
@@ -323,7 +330,7 @@ def run_texture_inference(image_path, mesh_path, output_dir, max_num_view=6, res
     textured_mesh_path = textured_mesh_dir / 'textured_mesh.glb'
 
     output_mesh_path = paint_pipeline(
-        mesh_path=str(mesh_path),
+        mesh_path=str(shape_mesh_path),
         image_path=str(image_path),
         output_mesh_path=str(textured_mesh_path)
     )
@@ -339,7 +346,6 @@ def run_texture_inference(image_path, mesh_path, output_dir, max_num_view=6, res
     return Path(output_mesh_path)
 
 def render_mesh(fname, mesh_path, render_dir, resolution=1024):
-    """Render a mesh (GLB/GLTF/OBJ/PLY) with Blender Cycles and save the image."""
     if bpy is None:
         raise RuntimeError("Blender Python API (bpy) is unavailable; run inside Blender 4.0+")
 
@@ -352,9 +358,10 @@ def render_mesh(fname, mesh_path, render_dir, resolution=1024):
     front_view_path = render_dir / f'{fname}.png'
 
     texture_root = mesh_path.parent
-    diffuse_path = texture_root / 'textured_mesh.jpg'
-    roughness_path = texture_root / 'textured_mesh_roughness.jpg'
-    metallic_path = texture_root / 'textured_mesh_metallic.jpg'
+    materials_dir = texture_root / 'materials'
+    diffuse_path = materials_dir / 'albedo.jpg'
+    roughness_path = materials_dir / 'roughness.jpg'
+    metallic_path = materials_dir / 'metallic.jpg'
 
     from mathutils import Matrix, Vector
     import addon_utils
@@ -406,22 +413,17 @@ def render_mesh(fname, mesh_path, render_dir, resolution=1024):
             try:
                 view_layer.cycles.denoiser = preferred
             except TypeError:
-                # Fallback to Blender default if preferred denoiser unavailable
                 view_layer.cycles.denoiser = 'NLM'
 
-    # Disable world background for transparent rendering
     if scene.world:
         if scene.world.use_nodes:
-            # Set background strength to 0 for transparency
             bg_node = scene.world.node_tree.nodes.get('Background')
             if bg_node is not None:
                 bg_node.inputs['Strength'].default_value = 0.0
         else:
-            # Create a minimal world setup with no background
             scene.world.use_nodes = True
             scene.world.node_tree.nodes.clear()
     else:
-        # Create world if it doesn't exist
         scene.world = bpy.data.worlds.new("TransparentWorld")
         scene.world.use_nodes = True
         scene.world.node_tree.nodes.clear()
@@ -441,16 +443,16 @@ def render_mesh(fname, mesh_path, render_dir, resolution=1024):
     if not imported_meshes:
         raise RuntimeError(f"No mesh geometry imported from {mesh_path}")
 
+    new_objects = [obj for obj in bpy.data.objects if obj not in existing_objects]
+    
     if mesh_ext in {'.glb', '.gltf'}:
         rotation_matrix = Matrix.Rotation(math.radians(90.0), 4, 'X')
-        new_objects = [obj for obj in bpy.data.objects if obj not in existing_objects]
         for obj in new_objects:
             obj.matrix_world = rotation_matrix @ obj.matrix_world
         bpy.context.view_layer.update()
         
-    if mesh_ext in [".obj", ".ply"]:
+    if mesh_ext in {'.obj', '.ply'}:
         rotation_matrix = Matrix.Rotation(math.radians(180.0), 4, 'Y')
-        new_objects = [obj for obj in bpy.data.objects if obj not in existing_objects]
         for obj in new_objects:
             obj.matrix_world = rotation_matrix @ obj.matrix_world
         bpy.context.view_layer.update()
@@ -536,200 +538,86 @@ def render_mesh(fname, mesh_path, render_dir, resolution=1024):
     light_obj.location = camera_obj.location
     light_obj.rotation_euler = camera_obj.rotation_euler
     scene.collection.objects.link(light_obj)
-    # _orient_to_target(light_obj, center)
 
     bpy.context.view_layer.update()
     bpy.ops.render.render(write_still=True, use_viewport=False)
 
     return front_view_path
 
-def refine_alpha(rgba_u8: np.ndarray, radius: int = 8, eps: float = 1e-4, tiny_feather_sigma: float = 0.5) -> np.ndarray:
-    # return rgba_u8[..., 3]  # Placeholder: skip refinement for now
-    assert rgba_u8.dtype == np.uint8 and rgba_u8.shape[-1] == 4, "Expect uint8 RGBA"
-    rgb_u8 = rgba_u8[..., :3]
-    a_u8   = rgba_u8[..., 3]
-
-    guide_gray_u8 = cv2.cvtColor(rgb_u8, cv2.COLOR_RGBA2GRAY) if rgb_u8.shape[-1] == 4 else \
-                    cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY)
-
-    a_f = a_u8.astype(np.float32) / 255.0
-
-    if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "guidedFilter"):
-        a_ref = cv2.ximgproc.guidedFilter(guide_gray_u8, a_f, radius, eps)
-    else:
-        a8 = (a_f * 255).astype(np.uint8)
-        a8_ref = cv2.bilateralFilter(a8, d=-1, sigmaColor=12, sigmaSpace=4)
-        a_ref = a8_ref.astype(np.float32) / 255.0
-
-    if tiny_feather_sigma and tiny_feather_sigma > 0:
-        a_ref = cv2.GaussianBlur(a_ref, (0, 0), sigmaX=tiny_feather_sigma)
-
-    a_ref_u8 = np.clip(a_ref * 255.0, 0, 255).astype(np.uint8)
-    return a_ref_u8
-
-def center_matted_image(image_path: Path, output_path: Path, bbox_ratio: float = 0.85):
-    """Center foreground object in RGBA image while preserving transparency."""
-    # Load image as RGBA
-    img = Image.open(image_path).convert("RGBA")
-    img_np = np.array(img, dtype=np.uint8)
-    background_remover = BackgroundRemover()
-    if img_np.shape[2] != 4:
-        raise ValueError(f"Image must have an alpha channel (RGBA), got shape: {img_np.shape}")
-    
-    # Load silhouette mask from silhouette_mask folder
-    image_stem = image_path.stem
-    silhouette_mask_dir = image_path.parent.parent / 'silhouette_mask'
-    silhouette_mask_path = silhouette_mask_dir / f'{image_stem}.png'
-    
-    if not silhouette_mask_path.exists():
-        raise FileNotFoundError(f"Silhouette mask not found: {silhouette_mask_path}")
-    
-    # Load silhouette mask as grayscale
-    silh_mask = Image.open(silhouette_mask_path).convert("L")
-    silh_mask_np = np.array(silh_mask, dtype=np.uint8)
-    
-    # Verify mask dimensions match image dimensions
-    if silh_mask_np.shape[:2] != img_np.shape[:2]:
-        raise ValueError(f"Silhouette mask dimensions {silh_mask_np.shape[:2]} do not match image dimensions {img_np.shape[:2]}")
-    
-    # Split into RGB and use silhouette mask as alpha
-    rgb = img_np[:, :, :3]
-    alpha = silh_mask_np  # Use silhouette mask as foreground mask
-    
-    canvas_h, canvas_w = img_np.shape[:2]
-    
-    # STEP 1: First, align the foreground to the bottom of the canvas
-    # Find bounding box of non-transparent pixels in original image
-    coords = cv2.findNonZero(alpha)
-    if coords is None:
-        raise ValueError(f"No foreground region found in image: {image_path}")
-    
-    x_orig, y_orig, w_orig, h_orig = cv2.boundingRect(coords)
-    
-    # Find the bottom-most non-transparent row in the original image
-    nonzero_rows = np.where(np.any(alpha > 0, axis=1))[0]
-    if len(nonzero_rows) == 0:
-        raise ValueError(f"No non-transparent pixels found in image")
-    
-    bottom_row_orig = nonzero_rows[-1]
-    padding_below_orig = (canvas_h - 1) - bottom_row_orig
-    
-    # If there's padding at the bottom, shift the entire image up to remove it
-    if padding_below_orig > 0:
-        # Create new arrays for bottom-aligned image
-        rgb_bottom_aligned = np.zeros_like(rgb)
-        alpha_bottom_aligned = np.zeros_like(alpha)
-        
-        # Shift everything down by padding_below_orig
-        rgb_bottom_aligned[padding_below_orig:, :] = rgb[:-padding_below_orig, :]
-        alpha_bottom_aligned[padding_below_orig:, :] = alpha[:-padding_below_orig, :]
-        
-        # Update rgb and alpha to use bottom-aligned versions
-        rgb = rgb_bottom_aligned
-        alpha = alpha_bottom_aligned
-    
-    # STEP 2: Now work with the bottom-aligned image
-    # Find bounding box of non-transparent pixels after bottom alignment
-    coords = cv2.findNonZero(alpha)
-    if coords is None:
-        raise ValueError(f"No foreground region found after bottom alignment")
-    
-    x, y, w, h = cv2.boundingRect(coords)
-    
-    # Extract foreground region (RGB + alpha)
-    fg_rgb = rgb[y:y+h, x:x+w]
-    fg_alpha = alpha[y:y+h, x:x+w]
-    
-    canvas_h, canvas_w = img_np.shape[:2]
-    
-    # Calculate scale to fit within bbox_ratio of canvas
-    max_size = int(min(canvas_h, canvas_w) * bbox_ratio)
-    scale = min(max_size / w, max_size / h)
-    
-    # Resize if needed
-    if scale < 1.0:
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-        fg_rgb = cv2.resize(fg_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        fg_alpha = cv2.resize(fg_alpha, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    else:
-        new_w, new_h = w, h
-    
-    # Create transparent canvas
-    centered_rgb = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
-    centered_alpha = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
-    
-    # STEP 3: Place the foreground centered horizontally and at the bottom vertically
-    x_offset = (canvas_w - new_w) // 2  # Center horizontally (equal left/right padding)
-    y_offset = canvas_h - new_h  # Align to bottom (foreground already bottom-aligned from Step 1)
-    
-    # Place foreground with horizontal centering and bottom alignment
-    centered_rgb[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = fg_rgb
-    centered_alpha[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = fg_alpha
-    
-    # Combine RGB and alpha
-    centered_img = np.dstack([centered_rgb, centered_alpha])
-    # Convert to RGB PIL Image (removing alpha channel)
-    centered_img_pil = Image.fromarray(centered_img)
-    centered_img_rgb = centered_img_pil.convert("RGB")
-    centered_image_rgba, centered_image_mask = background_remover.remove_background(centered_img_rgb, refine_foreground=True)
-    
-    
-    # # Ensure only the largest connected component is kept in the mask
-    centered_mask_np = np.array(centered_image_mask, dtype=np.uint8)
-
-    # # Find all connected components
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(centered_mask_np, connectivity=8)
-
-    if num_labels > 2:  # More than just background (label 0) and one foreground component
-        # Find the largest component (excluding background at label 0)
-        largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-        
-        # Create new mask with only the largest component
-        centered_mask_np = (labels == largest_label).astype(np.uint8) * 255
-        
-        print(f"  Removed {num_labels - 2} smaller connected components, keeping largest foreground region")
-
-    # Apply the cleaned mask to the RGBA image
-    centered_image_rgba_np = np.array(centered_image_rgba, dtype=np.uint8)
-    centered_image_rgba_np[..., 3] = centered_mask_np 
-    # Set background pixels (where mask is 0) to white
-    centered_image_rgba_np[centered_mask_np == 0, :3] = 255
-    centered_image_rgba = Image.fromarray(centered_image_rgba_np)
-    
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    centered_image_rgba.save(output_path)
-    print(f"Saved centered matted image to: {output_path}")
-
-def run_single_inference(image_name: str, output_dir, force_recompute: bool = False):
-    """Main function to run the shape inference pipeline."""
+def run_single_inference(image_name, output_dir, force_recompute=False):
     fname = image_name
     matted_image_path = output_dir / 'matted_image_centered' / f'{fname}.png'
 
     if not matted_image_path.is_file():
         raise FileNotFoundError(f"Matted image not found: {matted_image_path}")
 
-    mesh_path = output_dir / 'shape_mesh' / f'{fname}.glb'
-    textured_mesh_path = output_dir / 'textured_mesh' / fname / 'textured_mesh.glb'
+    hunyuan_3d_output_dir = output_dir / 'hunyuannn'
+    hunyuan_3d_output_dir.mkdir(parents=True, exist_ok=True)
+    shape_mesh_path = hunyuan_3d_output_dir / fname / 'shape_mesh.glb'
+    textured_mesh_path = hunyuan_3d_output_dir / fname / 'textured_mesh.glb'
 
-    if mesh_path.exists() and not force_recompute:
-        print(f"Mesh already exists at {mesh_path}, skipping shape inference.")
-    else:
-        seed = int(time.time())
-        run_shape_inference(
-            image_path=str(matted_image_path),
-            output_dir=str(output_dir),
-            seed=seed
-        )
-
+    shape_mesh_path.parent.mkdir(parents=True, exist_ok=True)
+    textured_mesh_path.parent.mkdir(parents=True, exist_ok=True)
+    
     if textured_mesh_path.exists() and not force_recompute:
         print(f"Textured mesh already exists at {textured_mesh_path}, skipping texture inference.")
     else:
+        if shape_mesh_path.exists() and not force_recompute:
+            print(f"Mesh already exists at {shape_mesh_path}, skipping shape inference.")
+        else:
+            seed = int(time.time())
+            run_shape_inference(
+                image_path=str(matted_image_path),
+                output_dir=str(output_dir),
+                seed=seed
+            )
+
         textured_mesh_path = run_texture_inference(
             image_path=matted_image_path,
-            mesh_path=mesh_path,
+            shape_mesh_path=shape_mesh_path,
             output_dir=output_dir
         )
+        
+        # Delete intermediate files
+        files_to_delete = [
+            shape_mesh_path.parent / 'shape_mesh.glb',
+            textured_mesh_path.parent / 'textured_mesh.ply',
+            textured_mesh_path.parent / 'white_mesh_remesh.obj'
+        ]
+        for file_path in files_to_delete:
+            if file_path.exists():
+                try:
+                    file_path.unlink()
+                    print(f"Deleted intermediate file: {file_path}")
+                except Exception as e:
+                    print(f"Warning: Could not delete {file_path}: {e}")
+        
+        # Rename and move material files
+        materials_dir = textured_mesh_path.parent / 'materials'
+        materials_dir.mkdir(parents=True, exist_ok=True)
+        
+        material_files = [
+            ('textured_mesh_metallic.jpg', 'metallic.jpg'),
+            ('textured_mesh_roughness.jpg', 'roughness.jpg'),
+            ('textured_mesh.jpg', 'albedo.jpg')
+        ]
+        
+        for old_name, new_name in material_files:
+            src_path = textured_mesh_path.parent / old_name
+            dst_path = materials_dir / new_name
+            try:
+                # First rename the file
+                temp_path = textured_mesh_path.parent / new_name
+                if src_path.exists():
+                    src_path.rename(temp_path)
+                    print(f"Renamed: {old_name} -> {new_name}")
+                
+                # Then move to materials directory
+                if temp_path.exists():
+                    temp_path.rename(dst_path)
+                print(f"Moved: {new_name} to materials/")
+            except Exception as e:
+                print(f"Warning: Could not rename/move {old_name}: {e}")
 
     render_dir = output_dir / 'render'
     render_dir.mkdir(parents=True, exist_ok=True)
@@ -743,7 +631,7 @@ def run_single_inference(image_name: str, output_dir, force_recompute: bool = Fa
             render_dir=render_dir,
         )
 
-def main(data_dir: str = "/workspace/outputs"):
+def main(data_dir="/workspace/outputs", force_recompute=False):
     output_dir = Path(data_dir)
     matted_images_dir = output_dir / 'image'
     matted_images_centered_dir = output_dir / 'matted_image_centered'
@@ -752,39 +640,27 @@ def main(data_dir: str = "/workspace/outputs"):
     if not matted_images_dir.exists():
         raise FileNotFoundError(f"Matted images directory not found: {matted_images_dir}")
 
-    # First pass: Center all matted images
-    for image_file in matted_images_dir.glob("*.png"):
-        image_name = image_file.stem
-        centered_output_path = matted_images_centered_dir / f'{image_name}.png'
-        render_image_output_path = output_dir / 'render' / f'{image_file.stem}.png'
-        
-        if render_image_output_path.exists():
-            continue
-
-        center_matted_image(
-            image_path=image_file,
-            output_path=centered_output_path,
-            bbox_ratio=0.80,
-        )
-        
-    import random
-    # Second pass: Run inference on each image
     image_files = list(matted_images_centered_dir.glob("*.png"))
     random.shuffle(image_files)
     for image_file in image_files:
-        render_image_output_path = output_dir / 'render' / f'{image_file.stem}.png'
-        if render_image_output_path.exists():
-            print(f"Rendered image already exists at {render_image_output_path}, skipping inference.")
-            continue
         try:
             print(f"Processing image: {image_file}")
             run_single_inference(
                 image_name=image_file.stem,
                 output_dir=output_dir,
-                force_recompute=True,
+                force_recompute=force_recompute,
             )
         except Exception as e:
             print(f"Error processing {image_file}: {e}")
         
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Hunyuan3D Inference Pipeline")
+    parser.add_argument('--data_dir', type=str, default="/workspace/outputs/",
+                        help='Path to the data directory')
+    parser.add_argument("--force_recompute", default=False,
+                        help='Force recomputation of shape and texture inference')
+    args = parser.parse_args()
+    main(
+        data_dir=args.data_dir,
+        force_recompute=args.force_recompute
+    )
